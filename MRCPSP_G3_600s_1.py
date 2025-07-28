@@ -10,7 +10,7 @@ import glob
 from google.cloud import storage
 from pysat.pb import PBEnc
 from pysat.formula import CNF, IDPool
-from pysat.solvers import Glucose42
+from pysat.solvers import Glucose3
 from pysat.card import CardEnc, EncType
 
 
@@ -407,7 +407,7 @@ class MRCPSPSATEncoder:
         self.add_makespan_constraint(makespan)
 
         # Solve with timeout
-        solver = Glucose42()
+        solver = Glucose3()
         solver.append_formula(self.cnf)
 
         # Check if we're running out of time
