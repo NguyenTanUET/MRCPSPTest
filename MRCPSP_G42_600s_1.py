@@ -6,17 +6,13 @@ Implement theo đúng công thức (6.1) - (6.17) trong tài liệu
 import os
 import csv
 import time
+import glob
+from google.cloud import storage
 from pysat.pb import PBEnc
 from pysat.formula import CNF, IDPool
 from pysat.solvers import Glucose42
 from pysat.card import CardEnc, EncType
 
-# Import Google Cloud Storage
-from google.cloud import storage
-
-
-# [Giữ nguyên tất cả các class MRCPSPDataReader và MRCPSPSATEncoder như cũ]
-# ... (code các class không thay đổi)
 
 class MRCPSPDataReader:
     """Đọc dữ liệu MRCPSP từ file .mm"""
@@ -521,27 +517,54 @@ class MRCPSPSATEncoder:
         return self.ES[self.jobs] if self.jobs in self.ES else 1
 
 
-def upload_to_gcs(local_file_path, bucket_name, destination_blob_name):
-    """Upload file to Google Cloud Storage bucket"""
+def upload_to_gcs(local_file_path, bucket_name, destination_path=None):
+    """Upload file to Google Cloud Storage using google-cloud-storage library"""
     try:
-        # Initialize the client
+        # Initialize client
         client = storage.Client()
 
-        # Get the bucket
+        # Get bucket
         bucket = client.bucket(bucket_name)
 
-        # Create a blob object from the filepath
-        blob = bucket.blob(destination_blob_name)
+        if destination_path is None:
+            destination_path = os.path.basename(local_file_path)
 
-        # Upload the file
-        blob.upload_from_filename(local_file_path)
+        # Add timestamp to filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        name, ext = os.path.splitext(destination_path)
+        destination_path = f"{name}_{timestamp}{ext}"
 
-        print(f"File {local_file_path} uploaded to gs://{bucket_name}/{destination_blob_name}")
-        return True
+        # Upload file
+        blob = bucket.blob(destination_path)
+
+        print(f"Uploading {local_file_path} to gs://{bucket_name}/{destination_path}")
+
+        # Upload with progress
+        with open(local_file_path, 'rb') as file_obj:
+            blob.upload_from_file(file_obj)
+
+        print(f"File uploaded successfully to gs://{bucket_name}/{destination_path}")
+        return True, f"gs://{bucket_name}/{destination_path}"
 
     except Exception as e:
         print(f"Error uploading to GCS: {e}")
-        return False
+        print("Possible solutions:")
+        print("1. Set GOOGLE_APPLICATION_CREDENTIALS environment variable")
+        print("2. Run 'gcloud auth application-default login'")
+        print("3. Make sure the bucket exists and you have write permissions")
+        return False, None
+
+
+def get_j30_files(max_files=1):
+    """Lấy danh sách 300 file đầu tiên từ thư mục data/j30"""
+    j30_pattern = "data/j30/*.mm"
+    all_files = glob.glob(j30_pattern)
+
+    # Sort để đảm bảo thứ tự nhất quán
+    all_files.sort()
+
+    # Lấy 300 file đầu tiên
+    return all_files[:max_files]
 
 
 def solve_instance(instance_file, timeout=600):
@@ -569,6 +592,7 @@ def solve_instance(instance_file, timeout=600):
         }
 
     except Exception as e:
+        print(f"Error solving {instance_file}: {e}")
         return {
             'instance': os.path.basename(instance_file).replace('.mm', ''),
             'horizon': 'N/A',
@@ -580,31 +604,60 @@ def solve_instance(instance_file, timeout=600):
 
 def main():
     # Configuration
-    BUCKET_NAME = "mrcpsp"
+    BUCKET_NAME = "mrcpsp"  
+    TIMEOUT_PER_INSTANCE = 600  # 10 phút cho mỗi instance
 
     # Ensure result directory exists
     os.makedirs('result', exist_ok=True)
 
-    # Output CSV file
-    output_file = 'result/MRCPSP_G42_600s_1.csv'
+    # Output CSV file với timestamp
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_file = f'result/MRCPSP_J30_300instances_{timestamp}.csv'
 
-    # List of instance files to solve
-    instance_files = [
-        'data/j102_2.mm',
-        'data/j102_5.mm',
-        'data/j104_1.mm'
-    ]
+    # Get 300 files from j30 directory
+    print("Đang tìm file trong thư mục data/j30...")
+    instance_files = get_j30_files(max_files=1)
+
+    print(f"Tìm thấy {len(instance_files)} file để chạy")
+    print(f"Timeout cho mỗi instance: {TIMEOUT_PER_INSTANCE} giây")
+    print(f"Tổng thời gian dự kiến tối đa: {len(instance_files) * TIMEOUT_PER_INSTANCE / 3600:.1f} giờ")
+
+    if len(instance_files) == 0:
+        print("Không tìm thấy file nào trong data/j30!")
+        return
 
     # Results list
     results = []
+    start_total_time = time.time()
 
     # Solve each instance
-    for instance_file in instance_files:
+    for i, instance_file in enumerate(instance_files, 1):
         if os.path.exists(instance_file):
-            print(f"Solving {instance_file}...")
-            result = solve_instance(instance_file, timeout=600)
+            print(f"\n[{i}/{len(instance_files)}] Solving {instance_file}...")
+
+            # Calculate elapsed time
+            elapsed_time = time.time() - start_total_time
+            avg_time_per_instance = elapsed_time / i if i > 1 else 0
+            estimated_remaining = (len(instance_files) - i) * avg_time_per_instance
+
+            print(f"Elapsed: {elapsed_time / 3600:.1f}h, ETA: {estimated_remaining / 3600:.1f}h")
+
+            result = solve_instance(instance_file, timeout=TIMEOUT_PER_INSTANCE)
             results.append(result)
-            print(f"Result: {result}")
+
+            print(f"Result: {result['status']}, Makespan: {result['makespan']}, Time: {result['time']}s")
+
+            # Save intermediate results every 10 instances
+            if i % 10 == 0:
+                print(f"Saving intermediate results... ({i} instances completed)")
+                save_results_to_csv(results, output_file)
+
+                # Try to upload intermediate results
+                print("Uploading intermediate results to GCS...")
+                success, gcs_path = upload_to_gcs(output_file, BUCKET_NAME)
+                if success:
+                    print(f"Intermediate results uploaded to {gcs_path}")
+
         else:
             print(f"File not found: {instance_file}")
             results.append({
@@ -615,7 +668,28 @@ def main():
                 'time': 'N/A'
             })
 
-    # Write results to CSV
+    # Save final results
+    save_results_to_csv(results, output_file)
+
+    total_time = time.time() - start_total_time
+    print(f"\nHoàn thành! Tổng thời gian: {total_time / 3600:.2f} giờ")
+    print(f"Results saved to: {output_file}")
+
+    # Upload final results to Google Cloud Storage
+    print(f"\nUploading final results to GCS bucket: {BUCKET_NAME}")
+    success, gcs_path = upload_to_gcs(output_file, BUCKET_NAME)
+
+    if success:
+        print(f"Successfully uploaded final results to {gcs_path}")
+    else:
+        print("Failed to upload final results to GCS")
+
+    # Display summary statistics
+    display_summary(results)
+
+
+def save_results_to_csv(results, output_file):
+    """Lưu kết quả vào file CSV"""
     with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['instance', 'horizon', 'makespan', 'status', 'time']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -627,27 +701,44 @@ def main():
         for result in results:
             writer.writerow(result)
 
-    print(f"\nResults saved to: {output_file}")
 
-    # Upload to Google Cloud Storage
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    gcs_filename = f"mrcpsp_results_{timestamp}.csv"
+def display_summary(results):
+    """Hiển thị thống kê tổng kết"""
+    print("\n" + "=" * 80)
+    print("THỐNG KÊ TỔNG KẾT")
+    print("=" * 80)
 
-    print(f"\nUploading results to GCS bucket: {BUCKET_NAME}")
-    success = upload_to_gcs(output_file, BUCKET_NAME, gcs_filename)
+    total = len(results)
+    optimal_count = sum(1 for r in results if r['status'] == 'Optimal')
+    feasible_count = sum(1 for r in results if r['status'] == 'Feasible')
+    timeout_count = sum(1 for r in results if r['status'] == 'Timeout')
+    error_count = sum(1 for r in results if r['status'] == 'Error')
+    infeasible_count = sum(1 for r in results if r['status'] == 'Infeasible')
 
-    if success:
-        print(f"Successfully uploaded to gs://{BUCKET_NAME}/{gcs_filename}")
-    else:
-        print("Failed to upload to GCS")
+    print(f"Tổng số instances: {total}")
+    print(f"Optimal: {optimal_count} ({optimal_count / total * 100:.1f}%)")
+    print(f"Feasible: {feasible_count} ({feasible_count / total * 100:.1f}%)")
+    print(f"Timeout: {timeout_count} ({timeout_count / total * 100:.1f}%)")
+    print(f"Error: {error_count} ({error_count / total * 100:.1f}%)")
+    print(f"Infeasible: {infeasible_count} ({infeasible_count / total * 100:.1f}%)")
 
-    # Display summary
-    print("\n=== SUMMARY ===")
-    print("Instance\t\tHorizon\tMakespan\tStatus\t\tTime(s)")
-    print("-" * 70)
-    for result in results:
-        print(
-            f"{result['instance']:<15}\t{result['horizon']}\t{result['makespan']}\t\t{result['status']:<10}\t{result['time']}")
+    # Thống kê thời gian
+    valid_times = [float(r['time']) for r in results if r['time'] != 'N/A' and isinstance(r['time'], (int, float))]
+    if valid_times:
+        print(f"\nThống kê thời gian giải:")
+        print(f"Trung bình: {sum(valid_times) / len(valid_times):.2f}s")
+        print(f"Tối thiểu: {min(valid_times):.2f}s")
+        print(f"Tối đa: {max(valid_times):.2f}s")
+
+    # Top 10 instances khó nhất (thời gian cao nhất)
+    print(f"\nTop 10 instances khó nhất:")
+    print("-" * 50)
+    sorted_results = sorted([r for r in results if r['time'] != 'N/A'],
+                            key=lambda x: float(x['time']) if isinstance(x['time'], (int, float)) else 0,
+                            reverse=True)
+
+    for i, result in enumerate(sorted_results[:10], 1):
+        print(f"{i:2d}. {result['instance']:<20} {result['time']:>8}s {result['status']}")
 
 
 if __name__ == "__main__":
