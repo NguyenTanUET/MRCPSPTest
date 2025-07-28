@@ -549,7 +549,7 @@ class MRCPSPSATEncoder:
 
 
 def main():
-    filename = "data/j102_5.mm"
+    filename = "data/j10/j102_5.mm"
 
     print(f"Đọc dữ liệu từ file: {filename}")
 
