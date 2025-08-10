@@ -3,6 +3,10 @@ MRCPSP SAT-based Pseudo-Boolean Encoding sử dụng PySAT
 Implement theo đúng công thức (6.1) - (6.17) trong tài liệu
 """
 
+import os
+import csv
+import time
+import glob
 from pysat.pb import PBEnc
 from pysat.formula import CNF, IDPool
 from pysat.solvers import Glucose42
@@ -151,12 +155,14 @@ class MRCPSPDataReader:
                 total_duration += max_duration
         return min(total_duration, 100)
 
-"Encoder theo đúng công thức (6.1) - (6.17)"
-class MRCPSPSATEncoder:
 
-    def __init__(self, mm_reader):
+class MRCPSPSATEncoder:
+    """Encoder theo đúng công thức (6.1) - (6.17)"""
+
+    def __init__(self, mm_reader, timeout=600):
         self.cnf = CNF()
-        self.vpool = IDPool()  # Use IDPool instead of dict
+        self.vpool = IDPool()
+        self.timeout = timeout
 
         # Lấy dữ liệu
         self.jobs = mm_reader.data['num_jobs']
@@ -173,19 +179,15 @@ class MRCPSPSATEncoder:
         # Tính time windows cho mỗi job
         self.calculate_time_windows()
 
-        print(f"Loaded: {self.jobs} jobs, horizon={self.horizon}")
-        print(f"Renewable resources: {self.R_capacity}")
-        print(f"Non-renewable resources: {self.N_capacity}")
-
-    "Tạo biến mới với optional name"
     def get_new_var(self, name=None):
+        """Tạo biến mới với optional name"""
         if name:
             return self.vpool.id(name)
         else:
             return self.vpool._next()
 
-    "Tính ES (earliest start) và LS (latest start) cho mỗi job"
     def calculate_time_windows(self):
+        """Tính ES (earliest start) và LS (latest start) cho mỗi job"""
         self.ES = {}
         self.LS = {}
 
@@ -221,11 +223,9 @@ class MRCPSPSATEncoder:
             max_duration = max(mode[0] for mode in self.job_modes[j])
             self.LS[j] = self.horizon - max_duration
 
-    "Tạo các biến theo công thức"
     def create_variables(self):
-
+        """Tạo các biến theo công thức"""
         # 1. S_i variables: thời điểm bắt đầu (sẽ encode bằng cách rời rạc hóa)
-        # Dùng biến boolean s_{i,t} = 1 nếu S_i = t
         self.s_vars = {}
         for j in range(1, self.jobs + 1):
             self.s_vars[j] = {}
@@ -251,8 +251,8 @@ class MRCPSPSATEncoder:
                     var = self.get_new_var(f'x_{j}_{t}_{m}')
                     self.x_vars[j][t][m] = var
 
-    "Ràng buộc: mỗi job có đúng một thời điểm bắt đầu"
     def add_start_time_constraints(self):
+        """Ràng buộc: mỗi job có đúng một thời điểm bắt đầu"""
         for j in range(1, self.jobs + 1):
             # Exactly one start time
             lits = []
@@ -269,8 +269,8 @@ class MRCPSPSATEncoder:
                     for k in range(i + 1, len(lits)):
                         self.cnf.append([-lits[i], -lits[k]])
 
-    "Ràng buộc chọn mode (công thức 6.11, 6.12, 6.17)"
     def add_mode_selection_constraints(self):
+        """Ràng buộc chọn mode (công thức 6.11, 6.12, 6.17)"""
         for j in range(1, self.jobs + 1):
             mode_vars = []
             for m in range(len(self.job_modes[j])):
@@ -285,8 +285,8 @@ class MRCPSPSATEncoder:
                 for k in range(i + 1, len(mode_vars)):
                     self.cnf.append([-mode_vars[i], -mode_vars[k]])
 
-    "Ràng buộc precedence (công thức 6.2, 6.9)"
     def add_precedence_constraints(self):
+        """Ràng buộc precedence (công thức 6.2, 6.9)"""
         for j in range(1, self.jobs + 1):
             if j not in self.precedence:
                 continue
@@ -296,9 +296,6 @@ class MRCPSPSATEncoder:
                 for m_j in range(len(self.job_modes[j])):
                     duration_j = self.job_modes[j][m_j][0]
 
-                    # sm_{j,m_j} => S_successor >= S_j + duration_j
-                    # Tức là: sm_{j,m_j} AND s_{j,t_j} => NOT s_{successor,t_s} for t_s < t_j + duration_j
-
                     for t_j in range(self.ES[j], self.LS[j] + 1):
                         if t_j not in self.s_vars[j]:
                             continue
@@ -307,22 +304,18 @@ class MRCPSPSATEncoder:
 
                         for t_s in range(self.ES[successor], min(completion_j, self.LS[successor] + 1)):
                             if t_s in self.s_vars[successor]:
-                                # NOT(sm_{j,m_j} AND s_{j,t_j} AND s_{successor,t_s})
                                 self.cnf.append([
                                     -self.sm_vars[j][m_j],
                                     -self.s_vars[j][t_j],
                                     -self.s_vars[successor][t_s]
                                 ])
 
-    "Định nghĩa biến x_{i,t,o} (công thức 6.13)"
     def add_running_variable_constraints(self):
+        """Định nghĩa biến x_{i,t,o} (công thức 6.13)"""
         for j in range(1, self.jobs + 1):
             for t in range(self.horizon + 1):
                 for m in range(len(self.job_modes[j])):
                     duration = self.job_modes[j][m][0]
-
-                    # x_{j,t,m} = 1 <=> sm_{j,m} = 1 AND S_j <= t < S_j + duration
-                    # Tương đương: x_{j,t,m} = 1 <=> sm_{j,m} = 1 AND OR(s_{j,t'} for t' in valid range)
 
                     valid_starts = []
                     for t_start in range(max(self.ES[j], t - duration + 1), min(t + 1, self.LS[j] + 1)):
@@ -343,11 +336,10 @@ class MRCPSPSATEncoder:
                         # No valid starts => x_{j,t,m} = 0
                         self.cnf.append([-self.x_vars[j][t][m]])
 
-    "Ràng buộc renewable resources (công thức 6.14)"
     def add_renewable_resource_constraints(self):
+        """Ràng buộc renewable resources (công thức 6.14)"""
         for k in range(self.renewable_resources):
             for t in range(self.horizon + 1):
-                # Collect variables and weights for PB constraint
                 resource_vars = []
                 resource_weights = []
 
@@ -362,11 +354,11 @@ class MRCPSPSATEncoder:
                 # PB constraint: sum <= capacity
                 if resource_vars:
                     pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                                self.R_capacity[k], vpool=self.vpool)
+                                                 self.R_capacity[k], vpool=self.vpool)
                     self.cnf.extend(pb_constraint)
 
-    "Ràng buộc non-renewable resources (công thức 6.15)"
     def add_nonrenewable_resource_constraints(self):
+        """Ràng buộc non-renewable resources (công thức 6.15)"""
         for k in range(self.nonrenewable_resources):
             resource_vars = []
             resource_weights = []
@@ -377,33 +369,29 @@ class MRCPSPSATEncoder:
                     if len(self.job_modes[j][m][1]) > resource_idx:
                         resource_req = self.job_modes[j][m][1][resource_idx]
                         if resource_req > 0:
-                            # Use sm_{j,m} variable
                             resource_vars.append(self.sm_vars[j][m])
                             resource_weights.append(resource_req)
 
             # PB constraint: total usage <= capacity
             if resource_vars:
                 pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                           self.N_capacity[k], vpool=self.vpool)
+                                             self.N_capacity[k], vpool=self.vpool)
                 self.cnf.extend(pb_constraint)
 
-    "Ràng buộc makespan (công thức 6.1)"
     def add_makespan_constraint(self, makespan):
-        # Job cuối (sink) phải bắt đầu <= makespan
+        """Ràng buộc makespan (công thức 6.1)"""
         sink_job = self.jobs
 
         for t in range(makespan + 1, self.LS[sink_job] + 1):
             if t in self.s_vars[sink_job]:
                 self.cnf.append([-self.s_vars[sink_job][t]])
 
-    "Giải với makespan cho trước"
     def solve(self, makespan):
-        print(f"\n--- Thử makespan = {makespan} ---")
+        """Giải với makespan cho trước"""
+        start_time = time.time()
 
         # Reset
         self.cnf = CNF()
-        self.var_counter = 1
-        self.variables = {}
 
         # Create all variables
         self.create_variables()
@@ -417,17 +405,25 @@ class MRCPSPSATEncoder:
         self.add_nonrenewable_resource_constraints()
         self.add_makespan_constraint(makespan)
 
-        print(f"Tổng số biến: {self.var_counter - 1}")
-        print(f"Tổng số clause: {len(self.cnf.clauses)}")
-
-        # Solve
+        # Solve with timeout
         solver = Glucose42()
         solver.append_formula(self.cnf)
 
-        if solver.solve():
-            return self.extract_solution(solver.get_model())
-        else:
-            return None
+        # Check if we're running out of time
+        elapsed = time.time() - start_time
+        if elapsed >= self.timeout:
+            return None, True  # timeout
+
+        # Set remaining time for solver
+        remaining_time = max(1, int(self.timeout - elapsed))
+
+        try:
+            if solver.solve():
+                return self.extract_solution(solver.get_model()), False
+            else:
+                return None, False
+        except:
+            return None, True  # timeout or error
 
     def extract_solution(self, model):
         solution = {}
@@ -460,121 +456,222 @@ class MRCPSPSATEncoder:
 
         return solution
 
-    "Tìm makespan tối ưu"
     def find_optimal_makespan(self):
+        """Tìm makespan tối ưu"""
+        start_total_time = time.time()
+
         # Calculate bounds
         min_makespan = self.calculate_critical_path_bound()
         max_makespan = self.horizon
 
         best_makespan = None
         best_solution = None
-
-        print(f"Tìm makespan tối ưu trong [{min_makespan}, {max_makespan}]")
+        is_optimal = False
+        status = "Infeasible"
 
         # Binary search
         while min_makespan <= max_makespan:
+            # Check timeout
+            if time.time() - start_total_time >= self.timeout:
+                status = "Timeout"
+                break
+
             mid = (min_makespan + max_makespan) // 2
 
-            solution = self.solve(mid)
+            # Update remaining timeout for this solve attempt
+            remaining_time = self.timeout - (time.time() - start_total_time)
+            if remaining_time <= 0:
+                status = "Timeout"
+                break
+
+            self.timeout = max(1, remaining_time)
+            solution, timeout_occurred = self.solve(mid)
+
+            if timeout_occurred:
+                status = "Timeout"
+                break
 
             if solution:
                 best_makespan = mid
                 best_solution = solution
                 max_makespan = mid - 1
+                status = "Feasible"
+                # Check if this is optimal (no better solution possible)
+                if mid == min_makespan:
+                    is_optimal = True
+                    status = "Optimal"
             else:
                 min_makespan = mid + 1
 
-        return best_makespan, best_solution
+        if is_optimal:
+            status = "Optimal"
+        elif best_makespan is not None:
+            status = "Feasible"
 
-    "Tính critical path lower bound"
+        total_time = time.time() - start_total_time
+        return best_makespan, best_solution, status, total_time
+
     def calculate_critical_path_bound(self):
-        # Use ES calculation
+        """Tính critical path lower bound"""
         return self.ES[self.jobs] if self.jobs in self.ES else 1
 
-    def validate_solution(self, solution):
-        print("\n--- KIỂM TRA LỜI GIẢI ---")
-        valid = True
+def get_j30_files(max_files=300):
+    """Lấy danh sách 300 file đầu tiên từ thư mục data/j30"""
+    j30_pattern = "data/j30/*.mm"
+    all_files = glob.glob(j30_pattern)
 
-        # Check precedence
-        print("Kiểm tra precedence...")
-        for j in range(1, self.jobs + 1):
-            if j in solution and j in self.precedence:
-                for succ in self.precedence[j]:
-                    if succ in solution:
-                        if solution[j]['finish_time'] > solution[succ]['start_time']:
-                            print(f"Vi phạm precedence: {j} -> {succ}")
-                            valid = False
+    # Sort để đảm bảo thứ tự nhất quán
+    all_files.sort()
 
-        # Check renewable resources
-        print("Kiểm tra renewable resources...")
-        for k in range(self.renewable_resources):
-            for t in range(self.horizon + 1):
-                usage = 0
-                for j in solution:
-                    if solution[j]['start_time'] <= t < solution[j]['finish_time']:
-                        usage += solution[j]['resources'][k]
-
-                if usage > self.R_capacity[k]:
-                    print(f"Vi phạm renewable resource {k+1} tại t={t}: {usage} > {self.R_capacity[k]}")
-                    valid = False
-
-        # Check non-renewable resources
-        print("Kiểm tra non-renewable resources...")
-        for k in range(self.nonrenewable_resources):
-            total_usage = 0
-            for j in solution:
-                total_usage += solution[j]['resources'][self.renewable_resources + k]
-
-            if total_usage > self.N_capacity[k]:
-                print(f"Vi phạm non-renewable resource {k+1}: {total_usage} > {self.N_capacity[k]}")
-                valid = False
-
-        if valid:
-            print("Lời giải hợp lệ!")
-
-        return valid
-
-    def print_solution(self, solution, makespan):
-        print(f"\n=== LỜI GIẢI TỐI ƯU ===")
-        print(f"Makespan: {makespan}")
-        print("\nLịch trình:")
-        print("Job | Mode | Start | Duration | Finish | Resources")
-        print("-" * 60)
-
-        for j in sorted(solution.keys()):
-            info = solution[j]
-            res_str = ' '.join(f"{r:2d}" for r in info['resources'])
-            print(f"{j:3d} | {info['mode']+1:4d} | {info['start_time']:5d} | "
-                  f"{info['duration']:8d} | {info['finish_time']:6d} | {res_str}")
+    # Lấy 300 file đầu tiên
+    return all_files[:max_files]
 
 
-def main():
-    filename = "data/j10/j1014_8.mm"
-
-    print(f"Đọc dữ liệu từ file: {filename}")
-
+def solve_instance(instance_file, timeout=600):
+    """Giải một instance và trả về kết quả"""
     try:
-        # Read data
-        reader = MRCPSPDataReader(filename)
+        # Extract instance name from file path
+        instance_name = os.path.basename(instance_file).replace('.mm', '')
 
-        # Create encoder
-        encoder = MRCPSPSATEncoder(reader)
+        # Read data
+        reader = MRCPSPDataReader(instance_file)
+        horizon = reader.get_horizon()
+
+        # Create encoder with timeout
+        encoder = MRCPSPSATEncoder(reader, timeout)
 
         # Find optimal makespan
-        optimal_makespan, solution = encoder.find_optimal_makespan()
+        makespan, solution, status, solve_time = encoder.find_optimal_makespan()
 
-        if optimal_makespan and solution:
-            encoder.print_solution(solution, optimal_makespan)
-            encoder.validate_solution(solution)
-        else:
-            print("Không tìm thấy lời giải!")
+        return {
+            'instance': instance_name,
+            'horizon': horizon,
+            'makespan': makespan if makespan is not None else 'N/A',
+            'status': status,
+            'time': round(solve_time, 2)
+        }
 
-    except FileNotFoundError:
-        print(f"Lỗi: Không tìm thấy file '{filename}'")
     except Exception as e:
-        print(f"Lỗi: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error solving {instance_file}: {e}")
+        return {
+            'instance': os.path.basename(instance_file).replace('.mm', ''),
+            'horizon': 'N/A',
+            'makespan': 'N/A',
+            'status': 'Error',
+            'time': 'N/A'
+        }
+
+def main():
+    # Configuration
+    TIMEOUT_PER_INSTANCE = 600  # 10 phút cho mỗi instance
+
+    # Ensure result directory exists
+    os.makedirs('result', exist_ok=True)
+
+    # Output CSV file với timestamp
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_file = f'result/MRCPSP_J30_300instances_{timestamp}.csv'
+
+    # Get 300 files from j30 directory
+    print("Đang tìm file trong thư mục data/j30...")
+    instance_files = get_j30_files(max_files=300)
+
+    print(f"Tìm thấy {len(instance_files)} file để chạy")
+    print(f"Timeout cho mỗi instance: {TIMEOUT_PER_INSTANCE} giây")
+    print(f"Tổng thời gian dự kiến tối đa: {len(instance_files) * TIMEOUT_PER_INSTANCE / 3600:.1f} giờ")
+
+    if len(instance_files) == 0:
+        print("Không tìm thấy file nào trong data/j30!")
+        return
+
+    # Results list
+    results = []
+    start_total_time = time.time()
+
+    # Solve each instance
+    for i, instance_file in enumerate(instance_files, 1):
+        if os.path.exists(instance_file):
+            print(f"\n[{i}/{len(instance_files)}] Solving {instance_file}...")
+
+            # Calculate elapsed time
+            elapsed_time = time.time() - start_total_time
+            avg_time_per_instance = elapsed_time / i if i > 1 else 0
+            estimated_remaining = (len(instance_files) - i) * avg_time_per_instance
+
+            print(f"Elapsed: {elapsed_time / 3600:.1f}h, ETA: {estimated_remaining / 3600:.1f}h")
+
+            result = solve_instance(instance_file, timeout=TIMEOUT_PER_INSTANCE)
+            results.append(result)
+
+            print(f"Result: {result['status']}, Makespan: {result['makespan']}, Time: {result['time']}s")
+
+            # Save intermediate results every 10 instances
+            if i % 10 == 0:
+                print(f"Saving intermediate results... ({i} instances completed)")
+                save_results_to_csv(results, output_file)
+
+        else:
+            print(f"File not found: {instance_file}")
+            results.append({
+                'instance': os.path.basename(instance_file).replace('.mm', ''),
+                'horizon': 'N/A',
+                'makespan': 'N/A',
+                'status': 'File Not Found',
+                'time': 'N/A'
+            })
+
+    # Save final results
+    save_results_to_csv(results, output_file)
+
+    total_time = time.time() - start_total_time
+    print(f"\nHoàn thành! Tổng thời gian: {total_time / 3600:.2f} giờ")
+    print(f"Results saved to: {output_file}")
+
+    # Display summary statistics
+    display_summary(results)
+
+
+def save_results_to_csv(results, output_file):
+    """Lưu kết quả vào file CSV"""
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['instance', 'horizon', 'makespan', 'status', 'time']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        # Write header
+        writer.writeheader()
+
+        # Write results
+        for result in results:
+            writer.writerow(result)
+
+
+def display_summary(results):
+    """Hiển thị thống kê tổng kết"""
+    print("\n" + "=" * 80)
+    print("THỐNG KÊ TỔNG KẾT")
+    print("=" * 80)
+
+    total = len(results)
+    optimal_count = sum(1 for r in results if r['status'] == 'Optimal')
+    feasible_count = sum(1 for r in results if r['status'] == 'Feasible')
+    timeout_count = sum(1 for r in results if r['status'] == 'Timeout')
+    error_count = sum(1 for r in results if r['status'] == 'Error')
+    infeasible_count = sum(1 for r in results if r['status'] == 'Infeasible')
+
+    print(f"Tổng số instances: {total}")
+    print(f"Optimal: {optimal_count} ({optimal_count / total * 100:.1f}%)")
+    print(f"Feasible: {feasible_count} ({feasible_count / total * 100:.1f}%)")
+    print(f"Timeout: {timeout_count} ({timeout_count / total * 100:.1f}%)")
+    print(f"Error: {error_count} ({error_count / total * 100:.1f}%)")
+    print(f"Infeasible: {infeasible_count} ({infeasible_count / total * 100:.1f}%)")
+
+    # Thống kê thời gian
+    valid_times = [float(r['time']) for r in results if r['time'] != 'N/A' and isinstance(r['time'], (int, float))]
+    if valid_times:
+        print(f"\nThống kê thời gian giải:")
+        print(f"Trung bình: {sum(valid_times) / len(valid_times):.2f}s")
+        print(f"Tối thiểu: {min(valid_times):.2f}s")
+        print(f"Tối đa: {max(valid_times):.2f}s")
 
 
 if __name__ == "__main__":
