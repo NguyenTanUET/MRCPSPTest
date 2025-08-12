@@ -10,13 +10,13 @@ def compare_original_vs_blockbased(instance_file):
     """So sánh chi tiết giữa Original và Block-based encoding"""
 
     # Import các encoders
-    from MRCPSTest import MRCPSPDataReader, MRCPSPSATEncoder as OriginalEncoder
+    from MRCPSP_Basic import MRCPSPDataReader, MRCPSPSATEncoder as OriginalEncoder
 
     try:
-        from Improved_Fix_Root import MRCPSPBlockBasedStaircase
+        from MRCPSP_SCAMO import MRCPSPBlockBasedStaircase
     except ImportError:
         print("Warning: Cannot import MRCPSPBlockBasedStaircase")
-        print("Make sure Improved_Fix_Root.py exists in the same directory")
+        print("Make sure MRCPSP_SCAMO.py exists in the same directory")
         MRCPSPBlockBasedStaircase = None
 
     # Read instance

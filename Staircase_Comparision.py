@@ -11,10 +11,10 @@ def compare_encodings_detailed(instance_file):
 
     # Import các encoders
     from No_Cloud_MRCPSP_G42_600s_1 import MRCPSPSATEncoder
-    from Improved_Fix_Root import MRCPSPBlockBasedStaircase
+    from MRCPSP_SCAMO import MRCPSPBlockBasedStaircase
 
     try:
-        from MRCPSTest import MRCPSPDataReader
+        from MRCPSP_Basic import MRCPSPDataReader
     except:
         print("Cannot import MRCPSPDataReader")
         return
@@ -113,7 +113,7 @@ def analyze_block_structure(reader, job, block_width):
     print(f"PHÂN TÍCH BLOCK STRUCTURE CHO JOB {job}")
     print(f"{'=' * 60}")
 
-    from Improved_Fix_Root import MRCPSPBlockBasedStaircase
+    from MRCPSP_SCAMO import MRCPSPBlockBasedStaircase
 
     encoder = MRCPSPBlockBasedStaircase(reader, block_width=block_width)
     encoder.calculate_time_windows()
@@ -166,7 +166,7 @@ def main():
 
     # 2. Phân tích block structure cho vài jobs
     try:
-        from MRCPSTest import MRCPSPDataReader
+        from MRCPSP_Basic import MRCPSPDataReader
         reader = MRCPSPDataReader(test_file)
 
         print("\n" + "=" * 100)

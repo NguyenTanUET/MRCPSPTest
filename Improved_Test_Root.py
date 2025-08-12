@@ -455,7 +455,7 @@ def compare_standard_vs_staircase(instance_file):
 
     # Import data reader
     try:
-        from MRCPSTest import MRCPSPDataReader
+        from MRCPSP_Basic import MRCPSPDataReader
     except:
         try:
             from No_Cloud_MRCPSP_G42_600s_1 import MRCPSPDataReader

@@ -4,7 +4,7 @@ Dựa theo bài báo: độ rộng block phụ thuộc vào sequence của biế
 """
 
 import math
-from MRCPSTest import MRCPSPDataReader
+from MRCPSP_Basic import MRCPSPDataReader
 
 
 class AdaptiveBlockWidth:
@@ -223,7 +223,7 @@ def compare_adaptive_vs_fixed(instance_file):
     So sánh Adaptive Block Width với Fixed Block Width
     """
 
-    from MRCPSTest import MRCPSPSATEncoder as OriginalEncoder
+    from MRCPSP_Basic import MRCPSPSATEncoder as OriginalEncoder
 
     print("=" * 100)
     print("SO SÁNH ADAPTIVE vs FIXED BLOCK WIDTH")
