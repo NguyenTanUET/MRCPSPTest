@@ -449,28 +449,46 @@ class MRCPSPBlockBasedStaircase:
                         thr = t_pred + dur - 1
                         if thr < self.ES[succ]:
                             continue
-                        # fully-before blocks
+                        # 1) For every block fully <= threshold: forbid entire block
                         for (bid, st, en, _bt, _a, _b) in blocks:
                             last_t = en - 1
                             if last_t <= thr and st <= last_t:
                                 y, x = self.create_register_bits_for_block(bid, succ, st, en)
-                                if len(x) == 1:
+                                k = len(x)
+                                if k == 1:
                                     self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
-                                else:
-                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[-1]])
-                                self.stats['clauses'] += 1
-                        # containing block
+                                    self.stats['clauses'] += 1
+                                elif k >= 2:
+                                    self.cnf.append(
+                                        [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[k - 2]])
+                                    self.cnf.append(
+                                        [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
+                                    self.stats['clauses'] += 2
+
+                        # 2) For the block that contains threshold: forbid up to (thr)
                         for (bid, st, en, _bt, _a, _b) in blocks:
                             if st <= thr < en:
                                 y, x = self.create_register_bits_for_block(bid, succ, st, en)
+                                k = len(x)
                                 idx = thr - st
                                 if idx == 0:
                                     self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
-                                else:
-                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[idx-1]])
-                                self.stats['clauses'] += 1
-                                break
-
+                                    self.stats['clauses'] += 1
+                                elif idx < k - 1:
+                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[idx]])
+                                    self.stats['clauses'] += 1
+                                else:  # idx == k-1
+                                    if k == 1:
+                                        self.cnf.append(
+                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
+                                        self.stats['clauses'] += 1
+                                    else:
+                                        self.cnf.append(
+                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[k - 2]])
+                                        self.cnf.append(
+                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
+                                        self.stats['clauses'] += 2
+                                break  # only one containing block
     def add_process_variable_constraints(self):
         """Define process variables"""
         for j in range(1, self.jobs + 1):
@@ -827,7 +845,7 @@ def test_precedence_aware_encoding(test_file=None):
         return None, None
 
     if test_file is None:
-        test_file = "data/j10/j1059_6.mm"
+        test_file = "data/j30/j3013_8.mm"
 
     print("=" * 100)
     print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
