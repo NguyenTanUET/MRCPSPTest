@@ -1,7 +1,7 @@
 """
 MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
-Batch runner (CLOUD): quét toàn bộ .mm trong data/j30, giải với timeout 600s/instance,
-ghi CSV định kỳ 10 dòng/lần vào result/j30/ và upload lên GCS nếu cấu hình.
+Batch runner: quét toàn bộ .mm trong data/j30, giải với timeout 600s/instance,
+ghi CSV định kỳ 10 dòng/lần vào result/j30/.
 """
 
 from pysat.pb import PBEnc
@@ -12,20 +12,12 @@ import math
 from pathlib import Path
 import csv
 from datetime import datetime
-
-# GCS (tùy chọn)
-try:
-    from google.cloud import storage  # pip install google-cloud-storage
-    _GCS_AVAILABLE = True
-except Exception:
-    storage = None
-    _GCS_AVAILABLE = False
-
-# ===== NEW: imports cho sandbox subprocess & util =====
-import subprocess, sys, json, os, signal, traceback
+import multiprocessing as mp
+import subprocess, sys, json, os, signal, tempfile, traceback
+from pathlib import Path  # nếu chưa có
 
 # ==========================
-#  Phần ENCODER
+#  Phần ENCODER (giữ nguyên + bổ sung vài trường thống kê)
 # ==========================
 
 class MRCPSPBlockBasedStaircase:
@@ -70,11 +62,12 @@ class MRCPSPBlockBasedStaircase:
             'register_bits': 0,
             'connection_clauses': 0,
         }
+        # Thêm hai trường để lấy nhanh ra CSV
         self.last_var_count = 0
         self.last_clause_count = 0
 
     def calculate_time_windows(self):
-        """Calculate ES và LS cho từng job"""
+        """Calculate ES and LS cho từng job"""
         self.ES = {}
         self.LS = {}
 
@@ -110,6 +103,7 @@ class MRCPSPBlockBasedStaircase:
                 self.LS[j] = min(self.LS[j], self.horizon - max_duration)
 
     def get_adaptive_width_for_precedence(self, pred_job, succ_job):
+        """Tính block width kế thừa (rút gọn giữ nguyên logic gốc)"""
         pred_durations = [mode[0] for mode in self.job_modes[pred_job]]
         pred_min_duration = min(pred_durations)
         pred_max_duration = max(pred_durations)
@@ -148,6 +142,7 @@ class MRCPSPBlockBasedStaircase:
         return max(3, min(base_width, 15))
 
     def calculate_precedence_widths(self):
+        """Tính width cho mọi cặp precedence"""
         for pred in range(1, self.jobs + 1):
             if pred not in self.precedence:
                 continue
@@ -178,6 +173,7 @@ class MRCPSPBlockBasedStaircase:
             return self.register_bits[block_id]
         x_vars, y_vars = [], []
         for t in range(start, end):
+            # x là biến start-time
             if t in self.s_vars[job]:
                 x_vars.append(self.s_vars[job][t])
         if len(x_vars) >= 2:
@@ -410,8 +406,7 @@ class MRCPSPBlockBasedStaircase:
         return self.cnf
 
     def solve(self, makespan):
-        """Giải với makespan cho trước. LẤY BỘ NHỚ về ngay sau khi solve."""
-        # Reset cho mỗi lần mã hoá
+        # Reset
         self.cnf = CNF()
         self.vpool = IDPool()
         self.precedence_blocks = {}
@@ -433,7 +428,7 @@ class MRCPSPBlockBasedStaircase:
             self.last_solve_time = time.time() - start_time
             model = solver.get_model() if result else None
         finally:
-            # GIẢI PHÓNG BỘ NHỚ NATIVE CỦA SOLVER
+            # GIẢI PHÓNG BỘ NHỚ C CỦA SOLVER
             try:
                 solver.delete()
             except Exception:
@@ -442,6 +437,7 @@ class MRCPSPBlockBasedStaircase:
 
             # THẢ CNF LỚN + ÉP GC
             try:
+                # cắt reference đến mảng mệnh đề lớn
                 self.cnf.clauses.clear()
             except Exception:
                 pass
@@ -497,7 +493,7 @@ class MRCPSPBlockBasedStaircase:
         return max(critical_path, self.ES.get(self.jobs, 1))
 
 # ==========================
-#  Reader .mm
+#  Hàm tiện ích đọc .mm
 # ==========================
 def load_reader(mm_path):
     """Tải MRCPSPDataReader từ file .mm."""
@@ -508,26 +504,14 @@ def load_reader(mm_path):
     return MRCPSPDataReader(str(mm_path))
 
 # ==========================
-#  GCS helpers
-# ==========================
-def _upload_to_gcs(bucket_name: str, local_file: Path, dest_blob: str):
-    """Upload 1 file lên GCS: gs://bucket_name/dest_blob"""
-    if not _GCS_AVAILABLE:
-        print("google-cloud-storage chưa được cài. Bỏ qua upload.")
-        return
-    client = storage.Client()  # dùng ADC hoặc GOOGLE_APPLICATION_CREDENTIALS
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(dest_blob)
-    blob.upload_from_filename(str(local_file))
-    print(f"  ☁ Uploaded to gs://{bucket_name}/{dest_blob}")
-
-# ==========================
-#  Giải 1 instance (nhị phân + timeout)
+#  Giải 1 instance với timeout & nhị phân makespan
 # ==========================
 def solve_instance_with_timeout(mm_path, timeout_s=600):
     """
     Trả về dict:
-      instance, horizon, variables, clauses, makespan, status, Solve time, timeout
+      instance, horizon, variables, clauses, makespan, status, solve_time, timeout
+    - status: Optimal / Feasible / Infeasible
+    - timeout: Yes/No
     """
     reader = load_reader(mm_path)
     enc = MRCPSPBlockBasedStaircase(reader)
@@ -542,13 +526,16 @@ def solve_instance_with_timeout(mm_path, timeout_s=600):
     best_clauses = 0
 
     lo, hi = lb, ub
+    # Nhị phân theo makespan, kiểm tra timeout trước mỗi lần gọi solver
     while lo <= hi:
-        if time.time() - start > timeout_s:
+        now = time.time()
+        if now - start > timeout_s:
             timeout_flag = True
             break
 
         mid = (lo + hi) // 2
         solution = enc.solve(mid)
+        # Thời gian có thể đã vượt quá sau khi solve
         if time.time() - start > timeout_s:
             timeout_flag = True
 
@@ -565,11 +552,18 @@ def solve_instance_with_timeout(mm_path, timeout_s=600):
 
     total_time = time.time() - start
 
-    status = (
-        "Optimal" if not timeout_flag and best_makespan is not None else
-        "Feasible" if timeout_flag and best_makespan is not None else
-        "Infeasible"
-    )
+    # Xác định status
+    if not timeout_flag:
+        if best_makespan is not None:
+            status = "Optimal"
+        else:
+            status = "Infeasible"
+    else:
+        if best_makespan is not None:
+            status = "Feasible"
+        else:
+            # hết giờ mà chưa tìm được nghiệm — ghi là Infeasible theo yêu cầu cột (không có 'Unknown')
+            status = "Infeasible"
 
     row = {
         "instance": Path(mm_path).name,
@@ -583,14 +577,66 @@ def solve_instance_with_timeout(mm_path, timeout_s=600):
     }
     return row
 
-# ==========================
-#  WORKER chế độ 1-instance (subprocess)
-# ==========================
+def _worker_solve(mm_path: str, timeout_s: int, q: mp.Queue):
+    """
+    Chạy trong tiến trình con. Tuyệt đối KHÔNG gọi sys.exit/os._exit ở đây.
+    Kết quả (dict) được put vào queue 'q'. Nếu gặp lỗi, put 1 dict báo lỗi.
+    """
+    try:
+        # import lại trong tiến trình con nếu file bạn chia tách module
+        # row = solve_instance_with_timeout(mm_path, timeout_s=timeout_s)
+        row = solve_instance_sandbox(mm_path, timeout_s=timeout_s)
+        q.put(("ok", row))
+    except Exception as e:
+        # log lỗi vào hàng đợi để tiến trình cha ghi vào CSV và tiếp tục
+        tb = traceback.format_exc()
+        q.put(("err", {
+            "instance": Path(mm_path).name,
+            "horizon": "",
+            "variables": "",
+            "clauses": "",
+            "makespan": "",
+            "status": "Infeasible",
+            "Solve time": "",
+            "timeout": "No",
+            "_error": f"{e}\n{tb}"
+        }))
+
+def solve_instance_sandbox(mm_path: Path, timeout_s: int):
+    """Bao instance trong tiến trình con để tránh rò rỉ/exit(0)."""
+    q = mp.Queue(maxsize=1)
+    p = mp.Process(target=_worker_solve, args=(str(mm_path), timeout_s, q), daemon=True)
+    p.start()
+    p.join(timeout=timeout_s + 5)
+
+    if p.is_alive():
+        p.terminate()
+        p.join(2)
+        return {"instance": mm_path.name, "horizon": "", "variables": "", "clauses": "",
+                "makespan": "", "status": "Infeasible",
+                "Solve time": f"{timeout_s:.2f}", "timeout": "Yes"}
+
+    try:
+        tag, payload = q.get_nowait()
+    except Exception:
+        # con thoát mà không trả gì (os._exit/crash)
+        return {"instance": mm_path.name, "horizon": "", "variables": "", "clauses": "",
+                "makespan": "", "status": "Infeasible",
+                "Solve time": "", "timeout": "No"}
+
+    if tag == "ok":
+        return payload
+    else:
+        print(f"  -> Child error on {mm_path.name}: {payload.get('_error','')[:300]}...")
+        payload.pop("_error", None)
+        return payload
+
 def _worker_main():
     """
     Chạy trong chế độ worker: giải đúng 1 instance rồi ghi JSON ra file --out.
+    Dùng stdout/stderr chỉ để log; dữ liệu trả về nằm trong file JSON.
     """
-    import argparse, gc
+    import argparse, time, gc
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--mm", required=True, help="Đường dẫn file .mm")
@@ -605,30 +651,41 @@ def _worker_main():
         row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout)
     except Exception as e:
         tb = traceback.format_exc()
-        row = {"instance": mm_path.name, "horizon": "", "variables": "", "clauses": "",
-               "makespan": "", "status": "Infeasible", "Solve time": "", "timeout": "No",
-               "_error": f"{e}\n{tb}"}
+        row = {
+            "instance": mm_path.name,
+            "horizon": "",
+            "variables": "",
+            "clauses": "",
+            "makespan": "",
+            "status": "Infeasible",
+            "Solve time": "",
+            "timeout": "No",
+            "_error": f"{e}\n{tb}",
+        }
 
+    # ghi JSON ra file
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(row, f, ensure_ascii=False)
 
+    # cố gắng thu dọn bộ nhớ để tránh phình RAM trong worker (dù worker sẽ exit ngay)
     try:
+        import gc
         gc.collect()
     except Exception:
         pass
 
 def _run_worker_for_instance(script_path: Path, mm_path: Path, timeout_s: int, tmp_dir: Path):
     """
-    Gọi subprocess: python <script> --worker --mm <mm> --timeout <t> --out <json>
-    - Kill cả process group khi timeout để không treo.
-    - Nếu worker chết/không tạo JSON -> trả fallback Infeasible.
+    Gọi subprocess: python <script_path> --worker --mm <mm> --timeout <t> --out <json_file>
+    - Bắt timeout/cúp cứng process group nếu treo.
+    - Nếu worker chết mà không tạo file JSON -> trả dòng fallback (Infeasible).
     """
     tmp_json = tmp_dir / f"{mm_path.stem}.json"
-    cmd = [sys.executable, str(script_path), "--worker", "--mm", str(mm_path),
-           "--timeout", str(timeout_s), "--out", str(tmp_json)]
+    cmd = [sys.executable, str(script_path), "--worker", "--mm", str(mm_path), "--timeout", str(timeout_s), "--out", str(tmp_json)]
 
-    preexec = os.setsid if hasattr(os, "setsid") else None  # Linux: tạo process group
+    # Tạo group để kill all children khi timeout (Linux)
+    preexec = os.setsid if hasattr(os, "setsid") else None
 
     try:
         p = subprocess.Popen(
@@ -641,6 +698,7 @@ def _run_worker_for_instance(script_path: Path, mm_path: Path, timeout_s: int, t
         try:
             out, _ = p.communicate(timeout=timeout_s + 30)
         except subprocess.TimeoutExpired:
+            # Kill cả group
             if preexec:
                 try:
                     os.killpg(p.pid, signal.SIGKILL)
@@ -651,17 +709,22 @@ def _run_worker_for_instance(script_path: Path, mm_path: Path, timeout_s: int, t
             except Exception:
                 pass
             out = ""
+        rc = p.returncode
     except Exception as e:
         out = f"[launcher-error] {e}"
+        rc = -999
 
+    # Nếu có log, in vài dòng đầu cho tiện debug (không bắt buộc)
     if out:
         for line in out.splitlines()[:5]:
             print("    [worker] " + line)
 
+    # Đọc JSON nếu có
     if tmp_json.exists():
         try:
             with open(tmp_json, "r", encoding="utf-8") as f:
                 row = json.load(f)
+            # dọn file tạm cho sạch
             try:
                 tmp_json.unlink()
             except Exception:
@@ -670,32 +733,31 @@ def _run_worker_for_instance(script_path: Path, mm_path: Path, timeout_s: int, t
         except Exception as e:
             print(f"    -> Lỗi đọc JSON: {e}")
 
-    return {"instance": mm_path.name, "horizon": "", "variables": "", "clauses": "",
-            "makespan": "", "status": "Infeasible", "Solve time": "", "timeout": "No"}
+    # Fallback nếu worker chết không trả dữ liệu
+    return {
+        "instance": mm_path.name,
+        "horizon": "",
+        "variables": "",
+        "clauses": "",
+        "makespan": "",
+        "status": "Infeasible",
+        "Solve time": "",
+        "timeout": "No"
+    }
 
 # ==========================
-#  Chạy hàng loạt & ghi CSV + upload GCS
+#  Chạy hàng loạt & ghi CSV theo lô 10
 # ==========================
-def run_batch_j30(
-    data_dir="data/j30",
-    out_dir="result/j30",
-    timeout_s=600,
-    gcs_bucket: str | None = None,
-    gcs_prefix: str | None = "result/j30"
-):
-    """
-    Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
-    gs://<gcs_bucket>/<gcs_prefix>/<csv_filename>
-    """
+def run_batch_j30(data_dir="data/j30", out_dir="result/j30", timeout_s=600):
     data_path = Path(data_dir)
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # chuẩn bị sandbox worker & file CSV
     script_path = Path(__file__).resolve()
-    tmp_dir = out_path / "_tmp_worker"
+    tmp_dir = Path(out_dir) / "_tmp_worker"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    # Tên file CSV có timestamp để không đè lẫn
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_file = out_path / f"MRCPSP_j30_results_{ts}.csv"
 
@@ -711,40 +773,49 @@ def run_batch_j30(
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
 
-    # Upload header lên GCS
-    if gcs_bucket:
-        dest_blob = f"{gcs_prefix.rstrip('/')}/{csv_file.name}" if gcs_prefix else csv_file.name
-        try:
-            _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
-        except Exception as e:
-            print(f"  ⚠ Không thể upload header lên GCS: {e}")
-
     for idx, mm in enumerate(mm_files, start=1):
         print(f"[{idx}/{len(mm_files)}] Solving {mm.name} ...")
         try:
-            # CHẠY TRONG SUBPROCESS CÁCH LY RAM/exit(0)
+            # row = solve_instance_with_timeout(mm, timeout_s=timeout_s)
             row = _run_worker_for_instance(script_path, mm, timeout_s, tmp_dir)
+
+        except SystemExit as e:
+            # Một lib nào đó gọi sys.exit(...) -> bắt lại để không chết cả batch
+            code = getattr(e, "code", 0)
+            print(f"  -> SystemExit({code}) while processing {mm.name}. Continuing.")
+            traceback.print_exc()
+            row = {
+                "instance": mm.name,
+                "horizon": "",
+                "variables": "",
+                "clauses": "",
+                "makespan": "",
+                "status": "Infeasible",
+                "Solve time": "",
+                "timeout": "No"
+            }
         except Exception as e:
             print(f"  -> Error instance {mm.name}: {e}")
-            row = {"instance": mm.name, "horizon": "", "variables": "", "clauses": "",
-                   "makespan": "", "status": "Infeasible", "Solve time": "", "timeout": "No"}
+            traceback.print_exc()
+            row = {
+                "instance": mm.name,
+                "horizon": "",
+                "variables": "",
+                "clauses": "",
+                "makespan": "",
+                "status": "Infeasible",
+                "Solve time": "",
+                "timeout": "No"
+            }
 
         results.append(row)
 
-        # Ghi theo lô mỗi 10 dòng
         if idx % 10 == 0:
             with csv_file.open("a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writerows(results[-10:])
             print(f"  ✓ Đã lưu tạm 10 dòng vào {csv_file}")
-
-            # Upload bản cập nhật CSV lên GCS
-            if gcs_bucket:
-                dest_blob = f"{gcs_prefix.rstrip('/')}/{csv_file.name}" if gcs_prefix else csv_file.name
-                try:
-                    _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
-                except Exception as e:
-                    print(f"  ⚠ Không thể upload batch lên GCS: {e}")
+            # (nếu dùng GCS thì upload ở đây như trước)
 
     # Ghi nốt phần còn lại (<10 cuối)
     remainder = len(results) % 10
@@ -754,33 +825,22 @@ def run_batch_j30(
             writer.writerows(results[-remainder:])
         print(f"  ✓ Đã lưu phần còn lại ({remainder} dòng) vào {csv_file}")
 
-    # Upload lần cuối
-    if gcs_bucket:
-        dest_blob = f"{gcs_prefix.rstrip('/')}/{csv_file.name}" if gcs_prefix else csv_file.name
-        try:
-            _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
-        except Exception as e:
-            print(f"  ⚠ Không thể upload lần cuối lên GCS: {e}")
-
     print(f"\nHoàn tất. Kết quả lưu tại: {csv_file}")
-    if gcs_bucket:
-        print(f"  Và tại: gs://{gcs_bucket}/{dest_blob}")
     return csv_file
 
 # ==========================
 #  Entry point
 # ==========================
 if __name__ == "__main__":
-    # Nếu được gọi như worker (chạy 1 instance duy nhất)
+    # Nếu được gọi như worker:
     if "--worker" in sys.argv:
         _worker_main()
         sys.exit(0)
 
-    # Chế độ batch (cloud)
+    # Ngược lại là chế độ batch
+    # Ví dụ chạy j30:
     run_batch_j30(
         data_dir="data/j30",
         out_dir="result/j30",
         timeout_s=600,
-        gcs_bucket="mrcpsp",
-        gcs_prefix="result/j30"
     )
