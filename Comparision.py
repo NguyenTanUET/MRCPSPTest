@@ -4,7 +4,7 @@ Chỉ tạo encoding, không giải bài toán
 """
 
 from MRCPSP_Basic import MRCPSPDataReader
-from MRCPSP_SCAMO_4 import MRCPSPBlockBasedStaircase
+from MRCPSP_SCAMO import MRCPSPBlockBasedStaircase
 from pysat.formula import CNF, IDPool
 from pysat.pb import PBEnc
 import time

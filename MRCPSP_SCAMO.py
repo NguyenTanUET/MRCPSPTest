@@ -1,6 +1,5 @@
 """
 MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
-Độ rộng block phụ thuộc vào mối quan hệ precedence giữa các jobs
 """
 
 from pysat.pb import PBEnc
@@ -42,19 +41,20 @@ class MRCPSPBlockBasedStaircase:
         self.register_bits = {}
         self.block_connections = []
 
+        # De-dup helpers
+        self.connected_pairs = set()
+        self.encoded_blocks = set()
+
         # Statistics
         self.stats = {
             'variables': 0,
             'clauses': 0,
-            'amo_blocks': 0,
-            'amz_blocks': 0,
             'register_bits': 0,
             'connection_clauses': 0,
-            'total_blocks': 0
         }
 
     def calculate_time_windows(self):
-        """Tính ES và LS cho mỗi job"""
+        """Calculate ES and LS for each job"""
         self.ES = {}
         self.LS = {}
 
@@ -206,7 +206,7 @@ class MRCPSPBlockBasedStaircase:
         window_end = min(self.LS[succ_job] + 1, latest_succ + 1)
 
         blocks = []
-        block_id_base = f"{pred_job}_{succ_job}"  # Unique ID for this precedence
+        block_id_base = f"J{succ_job}_W{window_start}_{window_end}_W{width}"  # successor-based id for sharing
 
         if window_end > window_start:
             num_blocks = (window_end - window_start + width - 1) // width
@@ -219,11 +219,9 @@ class MRCPSPBlockBasedStaircase:
                     block_id = f"{block_id_base}_{i}"
 
                     # First and last blocks are AMO, middle blocks have both AMO and AMZ
-                    if i == 0 or i == num_blocks - 1:
+                    if start < end:
+                        block_id = f"{block_id_base}_{i}"
                         blocks.append((block_id, start, end, 'AMO', pred_job, succ_job))
-                    else:
-                        blocks.append((block_id + "_amo", start, end, 'AMO', pred_job, succ_job))
-                        blocks.append((block_id + "_amz", start, end, 'AMZ', pred_job, succ_job))
 
         # Store blocks for this precedence
         self.precedence_blocks[(pred_job, succ_job)] = blocks
@@ -233,6 +231,25 @@ class MRCPSPBlockBasedStaircase:
             self.job_blocks[succ_job] = []
         self.job_blocks[succ_job].extend(blocks)
 
+        return blocks
+
+    def create_blocks_for_job(self, job, width=None):
+        es, ls = self.ES[job], self.LS[job]
+        if width is None:
+            win = max(1, ls - es + 1)
+            width = max(6, int(math.sqrt(win)))  # simple adaptive width
+        blocks = []
+        window_start, window_end = es, ls + 1
+        if window_end > window_start:
+            num_blocks = (window_end - window_start + width - 1) // width
+            for i in range(num_blocks):
+                start = window_start + i * width
+                end = min(start + width, window_end)
+                if start < end:
+                    block_id = f"J{job}_B{i}_{start}_{end}"
+                    blocks.append((block_id, start, end, 'AMO', job, job))
+        # store
+        self.job_blocks[job] = blocks
         return blocks
 
     def create_variables(self):
@@ -269,61 +286,64 @@ class MRCPSPBlockBasedStaircase:
                         self.stats['variables'] += 1
 
     def create_register_bits_for_block(self, block_id, job, start, end):
-        """Create register bits for a block"""
-        block_vars = []
-        register_bits = []
+        """Create (or reuse) register bits for a block.
+        Returns (y_vars, x_vars) where y_vars has length max(len(x_vars)-1, 0).
+        y_i corresponds to prefix up to x_{i+1} inside this block.
+        """
+        if block_id in self.register_bits:
+            return self.register_bits[block_id]
 
+        x_vars = []
+        y_vars = []
         for t in range(start, end):
             if t in self.s_vars[job]:
-                block_vars.append(self.s_vars[job][t])
-
-        if len(block_vars) > 0:
-            # First register bit is the first variable
-            register_bits.append(block_vars[0])
-
-            # Create additional register bits
-            for j in range(2, len(block_vars) + 1):
-                reg_var = self.vpool.id(f'R_{block_id}_{j}')
-                register_bits.append(reg_var)
+                x_vars.append(self.s_vars[job][t])
+        # allocate auxiliary y for each prefix beyond the first x
+        if len(x_vars) >= 2:
+            for j in range(1, len(x_vars)):
+                y = self.vpool.id(f'R_{block_id}_{j}')
+                y_vars.append(y)
                 self.stats['register_bits'] += 1
-
-        self.register_bits[block_id] = (register_bits, block_vars)
-        return register_bits, block_vars
+        self.register_bits[block_id] = (y_vars, x_vars)
+        return y_vars, x_vars
 
     def encode_amo_block(self, block_id, job, start, end):
-        """Encode AMO block with 4 formulas"""
-        register_bits, block_vars = self.create_register_bits_for_block(block_id, job, start, end)
-
-        if len(block_vars) <= 1:
+        """Encode AMO for x_vars in [start,end) using ladder with y_vars (idempotent)."""
+        if block_id in self.encoded_blocks:
             return
+        y_vars, x_vars = self.create_register_bits_for_block(block_id, job, start, end)
+        k = len(x_vars)
+        if k <= 1:
+            self.encoded_blocks.add(block_id)
+            return
+        # y_i is prefix up to x_{i+1}
+        # Clause set:
+        # 1) (¬x_1 ∨ y_1)
+        self.cnf.append([-x_vars[0], y_vars[0]])
+        self.stats['clauses'] += 1
 
-        # Formula (1): x_{i,j} → R_{i,j}
-        for j in range(1, len(block_vars)):
-            self.cnf.append([-block_vars[j], register_bits[j]])
+        # 2) For j=2..k-1: (¬x_j ∨ y_j)
+        for j in range(1, k-1):
+            self.cnf.append([-x_vars[j], y_vars[j]])
             self.stats['clauses'] += 1
 
-        # Formula (2): R_{i,j-1} → R_{i,j}
-        for j in range(1, len(block_vars)):
-            self.cnf.append([-register_bits[j - 1], register_bits[j]])
+        # 3) for j=1..k-2: (¬y_j ∨ y_{j+1})
+        for j in range(0, k-2):
+            self.cnf.append([-y_vars[j], y_vars[j+1]])
             self.stats['clauses'] += 1
 
-        # Formula (3): ¬x_{i,j} ∧ ¬R_{i,j-1} → ¬R_{i,j}
-        for j in range(1, len(block_vars)):
-            self.cnf.append([block_vars[j], register_bits[j - 1], -register_bits[j]])
+        # 4) for j=2..k: (¬x_j ∨ ¬y_{j-1})
+        for j in range(1, k):
+            self.cnf.append([-x_vars[j], -y_vars[j-1]])
             self.stats['clauses'] += 1
-
-        # Formula (4): x_{i,j} → ¬R_{i,j-1}
-        for j in range(1, len(block_vars)):
-            self.cnf.append([-block_vars[j], -register_bits[j - 1]])
-            self.stats['clauses'] += 1
-
-        self.stats['amo_blocks'] += 1
 
     def encode_amz_block(self, block_id, job, start, end):
-        """Encode AMZ block (no formula 4)"""
+        """Encode AMZ block (no formula 4); idempotent by block_id"""
+        if block_id in self.encoded_blocks:
+            return
         register_bits, block_vars = self.create_register_bits_for_block(block_id, job, start, end)
-
         if len(block_vars) <= 1:
+            self.encoded_blocks.add(block_id)
             return
 
         # Formula (1): x_{i,j} → R_{i,j}
@@ -343,42 +363,50 @@ class MRCPSPBlockBasedStaircase:
 
         # NO Formula (4) for AMZ
 
-        self.stats['amz_blocks'] += 1
-
     def connect_blocks(self, block1_id, block2_id):
-        """Connect two consecutive AMO blocks"""
+        """Connect consecutive blocks (forward carry).
+        Ensure y2_1 receives carry from y1_last; and boundary AMO across blocks.
+        Idempotent via self.connected_pairs.
+        """
         if block1_id not in self.register_bits or block2_id not in self.register_bits:
             return
-
-        reg_bits1, _ = self.register_bits[block1_id]
-        reg_bits2, _ = self.register_bits[block2_id]
-
-        if not reg_bits1 or not reg_bits2:
+        pair = (block1_id, block2_id)
+        if pair in self.connected_pairs:
             return
-
-        # Connection clauses
-        num_connections = min(len(reg_bits1), len(reg_bits2)) - 1
-
-        for j in range(1, num_connections + 1):
-            if j < len(reg_bits1) and j < len(reg_bits2):
-                self.cnf.append([-reg_bits1[j], -reg_bits2[j]])
-                self.stats['connection_clauses'] += 1
+        self.connected_pairs.add(pair)
+        y1, x1 = self.register_bits[block1_id]
+        y2, x2 = self.register_bits[block2_id]
+        if not x1 or not x2:
+            return
+        # forward carry only if both blocks have y's available
+        if y1 and y2:
+            # (¬y1_last ∨ y2_1)
+            self.cnf.append([-y1[-1], y2[0]])
+            self.stats['connection_clauses'] += 1
+        if y1:
+            # boundary AMO for first var of next block: (¬x2_1 ∨ ¬y1_last)
+            self.cnf.append([-x2[0], -y1[-1]])
+            self.stats['connection_clauses'] += 1
+        # no further per-index pairings needed; internal monotone handles rest
 
     def add_start_time_constraints(self):
-        """Exactly one start time for each job"""
+        """Exactly one start time for each job using SCAMO blocks"""
         for j in range(1, self.jobs + 1):
-            # At least one start time
-            vars_list = [self.s_vars[j][t] for t in range(self.ES[j], self.LS[j] + 1)
-                        if t in self.s_vars[j]]
+            # At least one start time (ALO)
+            vars_list = [self.s_vars[j][t] for t in range(self.ES[j], self.LS[j] + 1) if t in self.s_vars[j]]
             if vars_list:
                 self.cnf.append(vars_list)
                 self.stats['clauses'] += 1
 
-                # At most one (pairwise conflicts)
-                for i in range(len(vars_list)):
-                    for k in range(i + 1, len(vars_list)):
-                        self.cnf.append([-vars_list[i], -vars_list[k]])
-                        self.stats['clauses'] += 1
+            # Build & encode blocks
+            blocks = self.create_blocks_for_job(j)
+            for (block_id, start, end, _bt, _a, _b) in blocks:
+                self.encode_amo_block(block_id, j, start, end)
+
+            # Connect consecutive blocks once
+            for i in range(len(blocks) - 1):
+                self.connect_blocks(blocks[i][0], blocks[i + 1][0])
+
 
     def add_mode_selection_constraints(self):
         """Exactly one mode for each job"""
@@ -395,52 +423,72 @@ class MRCPSPBlockBasedStaircase:
                     self.cnf.append([-mode_vars[i], -mode_vars[k]])
                     self.stats['clauses'] += 1
 
+    
     def add_precedence_constraints_with_blocks(self):
-        """
-        Precedence constraints using precedence-aware blocks
-        Each precedence pair gets its own optimized encoding
+        """Precedence using job-level SCAMO y-vars.
+        For (pred->succ), if pred starts at t with mode m (dur=d), forbid succ start times ≤ t+d-1 by
+        setting certain prefix y-vars (or first x) to 0 via conditional clauses.
         """
         for pred in range(1, self.jobs + 1):
             if pred not in self.precedence:
                 continue
-
             for succ in self.precedence[pred]:
-                # Create blocks specific to this precedence relationship
-                blocks = self.create_blocks_for_precedence(pred, succ)
-
-                # Encode blocks
-                for block_id, start, end, block_type, _, _ in blocks:
-                    if block_type == 'AMO':
-                        self.encode_amo_block(block_id, succ, start, end)
-                    else:  # AMZ
-                        self.encode_amz_block(block_id, succ, start, end)
-                    self.stats['total_blocks'] += 1
-
-                # Connect consecutive AMO blocks
-                amo_blocks = [b for b in blocks if b[3] == 'AMO']
-                for i in range(len(amo_blocks) - 1):
-                    self.connect_blocks(amo_blocks[i][0], amo_blocks[i + 1][0])
-
-                # Add actual precedence constraints
-                for m_pred in range(len(self.job_modes[pred])):
-                    duration_pred = self.job_modes[pred][m_pred][0]
-
-                    for t_pred in range(self.ES[pred], self.LS[pred] + 1):
+                # ensure succ blocks exist and encoded
+                if succ not in self.job_blocks or not self.job_blocks[succ]:
+                    blocks = self.create_blocks_for_job(succ)
+                    for (bid, st, en, _bt, _a, _b) in blocks:
+                        self.encode_amo_block(bid, succ, st, en)
+                    for i in range(len(blocks)-1):
+                        self.connect_blocks(blocks[i][0], blocks[i+1][0])
+                blocks = sorted(self.job_blocks[succ], key=lambda b: b[1])
+                for m_pred, mode in enumerate(self.job_modes[pred]):
+                    dur = mode[0]
+                    for t_pred in range(self.ES[pred], self.LS[pred]+1):
                         if t_pred not in self.s_vars[pred]:
                             continue
+                        thr = t_pred + dur - 1
+                        if thr < self.ES[succ]:
+                            continue
+                        # 1) For every block fully <= threshold: forbid entire block
+                        for (bid, st, en, _bt, _a, _b) in blocks:
+                            last_t = en - 1
+                            if last_t <= thr and st <= last_t:
+                                y, x = self.create_register_bits_for_block(bid, succ, st, en)
+                                k = len(x)
+                                if k == 1:
+                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
+                                    self.stats['clauses'] += 1
+                                elif k >= 2:
+                                    self.cnf.append(
+                                        [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[k - 2]])
+                                    self.cnf.append(
+                                        [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
+                                    self.stats['clauses'] += 2
 
-                        earliest_succ = t_pred + duration_pred
-
-                        # Successor cannot start before earliest_succ
-                        for t_succ in range(self.ES[succ], min(earliest_succ, self.LS[succ] + 1)):
-                            if t_succ in self.s_vars[succ]:
-                                self.cnf.append([
-                                    -self.sm_vars[pred][m_pred],
-                                    -self.s_vars[pred][t_pred],
-                                    -self.s_vars[succ][t_succ]
-                                ])
-                                self.stats['clauses'] += 1
-
+                        # 2) For the block that contains threshold: forbid up to (thr)
+                        for (bid, st, en, _bt, _a, _b) in blocks:
+                            if st <= thr < en:
+                                y, x = self.create_register_bits_for_block(bid, succ, st, en)
+                                k = len(x)
+                                idx = thr - st
+                                if idx == 0:
+                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
+                                    self.stats['clauses'] += 1
+                                elif idx < k - 1:
+                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[idx]])
+                                    self.stats['clauses'] += 1
+                                else:  # idx == k-1
+                                    if k == 1:
+                                        self.cnf.append(
+                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
+                                        self.stats['clauses'] += 1
+                                    else:
+                                        self.cnf.append(
+                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[k - 2]])
+                                        self.cnf.append(
+                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
+                                        self.stats['clauses'] += 2
+                                break  # only one containing block
     def add_process_variable_constraints(self):
         """Define process variables"""
         for j in range(1, self.jobs + 1):
@@ -564,9 +612,6 @@ class MRCPSPBlockBasedStaircase:
         print(f"  - Basic vars: {self.stats['variables']}")
         print(f"  - Register bits: {self.stats['register_bits']}")
         print(f"Total clauses: {self.stats['clauses']}")
-        print(f"Total blocks: {self.stats['total_blocks']}")
-        print(f"  - AMO blocks: {self.stats['amo_blocks']}")
-        print(f"  - AMZ blocks: {self.stats['amz_blocks']}")
         print(f"Connection clauses: {self.stats['connection_clauses']}")
         print(f"Precedence pairs encoded: {len(self.precedence_widths)}")
 
@@ -586,11 +631,8 @@ class MRCPSPBlockBasedStaircase:
         self.stats = {
             'variables': 0,
             'clauses': 0,
-            'amo_blocks': 0,
-            'amz_blocks': 0,
             'register_bits': 0,
             'connection_clauses': 0,
-            'total_blocks': 0
         }
 
         # Encode
@@ -803,7 +845,7 @@ def test_precedence_aware_encoding(test_file=None):
         return None, None
 
     if test_file is None:
-        test_file = "data/j10/j1042_9.mm"
+        test_file = "data/j10/j1021_5.mm"
 
     print("=" * 100)
     print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
