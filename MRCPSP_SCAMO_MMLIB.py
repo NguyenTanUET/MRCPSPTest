@@ -7,7 +7,187 @@ from pysat.formula import CNF, IDPool
 from pysat.solvers import Glucose42
 import time
 import math
+# === MMLIB50 Reader (chịu REQUESTS/DURATIONS có/không có ':') ===
+import re
+from pathlib import Path
 
+class MMLIB50Reader:
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.data = self._read_file()
+
+    def _read_file(self):
+        text = Path(self.filename).read_text(encoding="utf-8", errors="ignore")
+        lines = [ln.rstrip() for ln in text.splitlines()]
+        data, idx, n = {}, 0, len(lines)
+
+        jobs_pat = re.compile(r'(?i)^jobs.*?:\s*(\d+)\s*$')
+        ren_pat  = re.compile(r'(?i)-\s*renewable\s*:?\s*(\d+)\s*R')
+        non_pat  = re.compile(r'(?i)-\s*nonrenewable\s*:?\s*(\d+)\s*N')
+
+        # Header
+        while idx < n:
+            s = lines[idx].strip()
+            if not s: idx += 1; continue
+            m = jobs_pat.match(s)
+            if m: data['num_jobs'] = int(m.group(1)); idx += 1; continue
+            m = ren_pat.search(s)
+            if m: data['num_renewable'] = int(m.group(1)); idx += 1; continue
+            m = non_pat.search(s)
+            if m: data['num_nonrenewable'] = int(m.group(1)); idx += 1; continue
+            if re.match(r'(?i)^PRECEDENCE RELATIONS', s):
+                idx += 1; break
+            idx += 1
+
+        # Precedence
+        data['precedence'] = {}; data['num_modes'] = {}
+        while idx < n and (not lines[idx].strip() or lines[idx].lower().startswith("jobnr.") or set(lines[idx].strip()) in ({'-'}, {'*'})):
+            idx += 1
+
+        while idx < n:
+            s = lines[idx].strip()
+            if re.match(r'(?i)^REQUESTS/DURATIONS:?$', s):
+                idx += 1; break
+            if not s or s.lower().startswith("jobnr.") or set(s) in ({'-'}, {'*'}):
+                idx += 1; continue
+            parts = s.split()
+            if not parts[0].isdigit():
+                idx += 1; continue
+            j = int(parts[0])
+            if len(parts) >= 2 and parts[1].isdigit():
+                data['num_modes'][j] = int(parts[1])
+            succs = [int(t) for t in parts[3:] if t.isdigit()]
+            data['precedence'][j] = succs
+            idx += 1
+
+        # Requests/Durations
+        R = data.get('num_renewable', 0); N = data.get('num_nonrenewable', 0)
+        job_modes, cur = {}, None
+
+        while idx < n and (
+                not lines[idx].strip() or lines[idx].lower().startswith("jobnr.") or set(lines[idx].strip()) == {'-'}):
+            idx += 1
+
+        while idx < n:
+            s = lines[idx].strip()
+            # dừng khi tới RESOURCE AVAILABILITIES
+            if re.match(r'^\*{5,}$', s) or re.match(r'(?i)^RESOURCE AVAILABILITIES', s):
+                break
+            if not s:
+                idx += 1;
+                continue
+
+            parts = s.split()
+            # --- phân biệt bằng số cột ---
+            if parts[0].isdigit():
+                if len(parts) >= 3 + R + N:
+                    # DÒNG JOB MỚI: jobnr, mode, dur, R..., N...
+                    cur = int(parts[0])
+                    dur = int(parts[2])
+                    reqs = [int(x) for x in parts[3:3 + R + N]]
+                    job_modes.setdefault(cur, []).append((dur, reqs))
+                elif len(parts) >= 2 + R + N and cur is not None:
+                    # DÒNG MODE TIẾP THEO: mode, dur, R..., N...
+                    dur = int(parts[1])
+                    reqs = [int(x) for x in parts[2:2 + R + N]]
+                    job_modes.setdefault(cur, []).append((dur, reqs))
+                # nếu không đủ cột thì bỏ qua
+            # dòng khác -> bỏ
+            idx += 1
+
+        data['job_modes'] = job_modes
+
+        # Resource capacities
+        while idx < n and not re.match(r'(?i)^RESOURCE AVAILABILITIES', lines[idx].strip()):
+            idx += 1
+        if idx < n and re.match(r'(?i)^RESOURCE AVAILABILITIES', lines[idx].strip()):
+            idx += 1
+            while idx < n and not re.match(r'^\s*\d', lines[idx].strip()):
+                idx += 1
+            caps = []
+            if idx < n:
+                caps = [int(t) for t in lines[idx].split() if t.isdigit()]
+                idx += 1
+            data['renewable_capacity'] = caps[:R] if R else []
+            data['nonrenewable_capacity'] = caps[R:R+N] if N else []
+        else:
+            data['renewable_capacity'] = [0]*R
+            data['nonrenewable_capacity'] = [0]*N
+
+        # optional horizon
+        for ln in lines:
+            if ln.strip().lower().startswith("horizon"):
+                toks = ln.strip().split()
+                try: data['horizon'] = int(toks[-1])
+                except: pass
+                break
+
+        return data
+
+    def get_horizon(self):
+        if 'horizon' in self.data:
+            return self.data['horizon']
+        total = 0
+        for _, modes in self.data.get('job_modes', {}).items():
+            if modes: total += max(m[0] for m in modes)
+        return max(total, 1)
+def _critical_path_lb_mmlib(reader: MMLIB50Reader):
+    prec = reader.data.get('precedence', {})
+    modes = reader.data.get('job_modes', {})
+    memo = {}
+    def f(j):
+        if j in memo: return memo[j]
+        succs = prec.get(j, [])
+        succ_max = max((f(s) for s in succs), default=0)
+        dur_min = min((m[0] for m in modes.get(j, [])), default=0)
+        memo[j] = dur_min + succ_max
+        return memo[j]
+    return max(f(1), 1)
+
+def run_one_mmlib50(instance_path: str, timeout_s: int = 600):
+    """
+    Giải duy nhất 1 instance MMLIB50 (binary search makespan, giới hạn tổng 600s).
+    """
+    from time import time
+    print("=" * 100)
+    print("RUN ONE MMLIB50 INSTANCE")
+    print("=" * 100)
+    print(f"Instance: {instance_path}")
+
+    reader = MMLIB50Reader(instance_path)
+    enc = MRCPSPBlockBasedStaircase(reader)
+
+    lb = _critical_path_lb_mmlib(reader)
+    ub = reader.get_horizon()
+
+    t0 = time()
+    lo, hi = lb, ub
+    best_ms, best_model = None, None
+
+    while lo <= hi:
+        if time() - t0 > timeout_s:
+            break
+        mid = (lo + hi) // 2
+        sol = enc.solve(mid)
+        if time() - t0 > timeout_s:
+            break
+        if sol:
+            best_ms, best_model = mid, sol
+            hi = mid - 1
+        else:
+            lo = mid + 1
+
+    dt = time() - t0
+    if best_ms is not None:
+        print(f"\n✓ Found feasible/optimal makespan = {best_ms} (time {dt:.2f}s)")
+        # nếu file bạn có sẵn các hàm hiển thị/validate:
+        try:
+            enc.print_solution(best_model, best_ms)
+            enc.validate_solution(best_model)
+        except Exception:
+            pass
+    else:
+        print(f"\n✗ No solution within {timeout_s}s (lb={lb}, ub={ub})")
 
 class MRCPSPBlockBasedStaircase:
     """MRCPSP Encoder với precedence-aware adaptive block width"""
@@ -186,7 +366,7 @@ class MRCPSPBlockBasedStaircase:
         if self.precedence_widths:
             widths = list(self.precedence_widths.values())
             print(f"\nWidth statistics:")
-            print(f"  Average: {sum(widths)/len(widths):.1f}")
+            print(f"  Average: {sum(widths) / len(widths):.1f}")
             print(f"  Min: {min(widths)}, Max: {max(widths)}")
             print(f"  Total precedence pairs: {len(self.precedence_widths)}")
 
@@ -323,18 +503,18 @@ class MRCPSPBlockBasedStaircase:
         self.stats['clauses'] += 1
 
         # 2) For j=2..k-1: (¬x_j ∨ y_j)
-        for j in range(1, k-1):
+        for j in range(1, k - 1):
             self.cnf.append([-x_vars[j], y_vars[j]])
             self.stats['clauses'] += 1
 
         # 3) for j=1..k-2: (¬y_j ∨ y_{j+1})
-        for j in range(0, k-2):
-            self.cnf.append([-y_vars[j], y_vars[j+1]])
+        for j in range(0, k - 2):
+            self.cnf.append([-y_vars[j], y_vars[j + 1]])
             self.stats['clauses'] += 1
 
         # 4) for j=2..k: (¬x_j ∨ ¬y_{j-1})
         for j in range(1, k):
-            self.cnf.append([-x_vars[j], -y_vars[j-1]])
+            self.cnf.append([-x_vars[j], -y_vars[j - 1]])
             self.stats['clauses'] += 1
 
     def encode_amz_block(self, block_id, job, start, end):
@@ -407,7 +587,6 @@ class MRCPSPBlockBasedStaircase:
             for i in range(len(blocks) - 1):
                 self.connect_blocks(blocks[i][0], blocks[i + 1][0])
 
-
     def add_mode_selection_constraints(self):
         """Exactly one mode for each job"""
         for j in range(1, self.jobs + 1):
@@ -423,7 +602,6 @@ class MRCPSPBlockBasedStaircase:
                     self.cnf.append([-mode_vars[i], -mode_vars[k]])
                     self.stats['clauses'] += 1
 
-    
     def add_precedence_constraints_with_blocks(self):
         """Precedence using job-level SCAMO y-vars.
         For (pred->succ), if pred starts at t with mode m (dur=d), forbid succ start times ≤ t+d-1 by
@@ -438,12 +616,12 @@ class MRCPSPBlockBasedStaircase:
                     blocks = self.create_blocks_for_job(succ)
                     for (bid, st, en, _bt, _a, _b) in blocks:
                         self.encode_amo_block(bid, succ, st, en)
-                    for i in range(len(blocks)-1):
-                        self.connect_blocks(blocks[i][0], blocks[i+1][0])
+                    for i in range(len(blocks) - 1):
+                        self.connect_blocks(blocks[i][0], blocks[i + 1][0])
                 blocks = sorted(self.job_blocks[succ], key=lambda b: b[1])
                 for m_pred, mode in enumerate(self.job_modes[pred]):
                     dur = mode[0]
-                    for t_pred in range(self.ES[pred], self.LS[pred]+1):
+                    for t_pred in range(self.ES[pred], self.LS[pred] + 1):
                         if t_pred not in self.s_vars[pred]:
                             continue
                         thr = t_pred + dur - 1
@@ -489,6 +667,7 @@ class MRCPSPBlockBasedStaircase:
                                             [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
                                         self.stats['clauses'] += 2
                                 break  # only one containing block
+
     def add_process_variable_constraints(self):
         """Define process variables"""
         for j in range(1, self.jobs + 1):
@@ -501,7 +680,7 @@ class MRCPSPBlockBasedStaircase:
                     valid_starts = []
 
                     for t_start in range(max(self.ES[j], t - duration + 1),
-                                       min(self.LS[j] + 1, t + 1)):
+                                         min(self.LS[j] + 1, t + 1)):
                         if t_start in self.s_vars[j] and t_start + duration > t:
                             valid_starts.append(self.s_vars[j][t_start])
 
@@ -544,7 +723,7 @@ class MRCPSPBlockBasedStaircase:
 
                 if resource_vars:
                     pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                                self.R_capacity[k], vpool=self.vpool)
+                                                 self.R_capacity[k], vpool=self.vpool)
                     self.cnf.extend(pb_constraint)
 
     def add_nonrenewable_resource_constraints(self):
@@ -564,7 +743,7 @@ class MRCPSPBlockBasedStaircase:
 
             if resource_vars:
                 pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                           self.N_capacity[k], vpool=self.vpool)
+                                             self.N_capacity[k], vpool=self.vpool)
                 self.cnf.extend(pb_constraint)
 
     def add_makespan_constraint(self, makespan):
@@ -754,7 +933,7 @@ class MRCPSPBlockBasedStaircase:
         for j in sorted(solution.keys()):
             info = solution[j]
             res_str = ' '.join(f"{r:2d}" for r in info['resources'])
-            print(f"{j:<5} {info['mode']+1:<6} {info['start_time']:<7} "
+            print(f"{j:<5} {info['mode'] + 1:<6} {info['start_time']:<7} "
                   f"{info['duration']:<10} {info['finish_time']:<8} "
                   f"{res_str:<20}")
 
@@ -799,7 +978,7 @@ class MRCPSPBlockBasedStaircase:
                             usage += info['resources'][k]
 
                 if usage > self.R_capacity[k]:
-                    print(f"  ✗ Renewable resource {k+1} violated at time {t}: "
+                    print(f"  ✗ Renewable resource {k + 1} violated at time {t}: "
                           f"usage={usage} > capacity={self.R_capacity[k]}")
                     valid = False
                     renewable_ok = False
@@ -819,7 +998,7 @@ class MRCPSPBlockBasedStaircase:
                     total_usage += info['resources'][resource_idx]
 
             if total_usage > self.N_capacity[k]:
-                print(f"  ✗ Non-renewable resource {k+1} violated: "
+                print(f"  ✗ Non-renewable resource {k + 1} violated: "
                       f"total usage={total_usage} > capacity={self.N_capacity[k]}")
                 valid = False
                 nonrenewable_ok = False
@@ -834,56 +1013,8 @@ class MRCPSPBlockBasedStaircase:
 
         return valid
 
-
-def test_precedence_aware_encoding(test_file=None):
-    """Test the precedence-aware block encoding"""
-
-    try:
-        from MRCPSP_Basic import MRCPSPDataReader
-    except:
-        print("Cannot import MRCPSPDataReader")
-        return None, None
-
-    if test_file is None:
-        test_file = "data/j20/j205_7.mm"
-
-    print("=" * 100)
-    print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
-    print("=" * 100)
-
-    reader = MRCPSPDataReader(test_file)
-
-    print(f"\nInstance: {test_file}")
-    print(f"Jobs: {reader.data['num_jobs']}")
-    print(f"Horizon: {reader.get_horizon()}")
-    print(f"Resources: R={reader.data['renewable_capacity']}, N={reader.data['nonrenewable_capacity']}")
-
-    # Show precedence structure
-    print(f"\nPrecedence structure:")
-    for j in range(1, min(reader.data['num_jobs'] + 1, 8)):  # Show first 7 jobs
-        if j in reader.data['precedence'] and reader.data['precedence'][j]:
-            print(f"  Job {j} → {reader.data['precedence'][j]}")
-
-    # Create encoder with precedence-aware blocks
-    encoder = MRCPSPBlockBasedStaircase(reader)
-
-    # Find optimal makespan
-    import time
-    start_time = time.time()
-    optimal_makespan, solution = encoder.find_optimal_makespan()
-    total_time = time.time() - start_time
-
-    if optimal_makespan and solution:
-        encoder.print_solution(solution, optimal_makespan)
-        encoder.validate_solution(solution)
-        print(f"\n✓ Successfully found optimal makespan = {optimal_makespan}")
-        print(f"Total solving time: {total_time:.2f}s")
-        return optimal_makespan, total_time
-    else:
-        print(f"\n✗ No solution found")
-        return None, None
-
 if __name__ == "__main__":
-    # Default test
-    test_precedence_aware_encoding()
-    print("\n" + "=" * 100)
+    DEFAULT_INSTANCE = "data/MMLIB50/J502_2.mm"
+    run_one_mmlib50(DEFAULT_INSTANCE, timeout_s=600)
+
+

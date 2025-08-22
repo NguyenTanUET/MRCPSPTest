@@ -204,36 +204,6 @@ class MRCPSPDataReader:
                     break
 
 
-def test_reader_with_files():
-    """Test reader với các file khác nhau"""
-
-    test_files = [
-        "data/j10/j103_2.mm",   # Small instance
-        "data/j30/j301_1.mm",   # Larger instance with horizon > 100
-    ]
-
-    for filename in test_files:
-        print("\n" + "=" * 80)
-        print(f"Testing file: {filename}")
-        print("=" * 80)
-
-        try:
-            reader = MRCPSPDataReader(filename)
-            reader.print_summary()
-
-            # Verify horizon
-            horizon = reader.get_horizon()
-            if horizon > 100:
-                print(f"\n✓ Successfully read horizon > 100: {horizon}")
-
-        except FileNotFoundError:
-            print(f"✗ File not found: {filename}")
-        except Exception as e:
-            print(f"✗ Error reading file: {e}")
-            import traceback
-            traceback.print_exc()
-
-
 def compare_reader_versions():
     """So sánh reader cũ và mới"""
 
@@ -268,8 +238,6 @@ def compare_reader_versions():
 
 
 if __name__ == "__main__":
-    # Test với nhiều files
-    test_reader_with_files()
 
     print("\n" + "=" * 80)
 
