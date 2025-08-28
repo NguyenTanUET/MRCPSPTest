@@ -1,7 +1,6 @@
 # MRCPSP_SMT_Z3_pretty.py
 # -----------------------------------------------------------
 # Giải 1 instance MMLIB50 bằng Z3 (SMT), in kết quả & validate.
-# In thêm: tổng số ràng buộc (assertions), tổng số biến quyết định, thời gian giải.
 # -----------------------------------------------------------
 
 from pathlib import Path
@@ -283,7 +282,7 @@ def solve_mrcpsp_with_z3(mm_path: str, timeout_ms: int = 600_000):
 # Run: Ấn Run là chạy 1 file
 # =========================
 if __name__ == "__main__":
-    DEFAULT_INSTANCE = "data/j20/j2010_3.mm"  # sửa sang file bạn muốn
+    DEFAULT_INSTANCE = "data/j10/j1017_1.mm"  # sửa sang file bạn muốn
 
     print("="*100)
     print("RUN ONE J20 INSTANCE (Z3 SMT) — Pretty Output")
