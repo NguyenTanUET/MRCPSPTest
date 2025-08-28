@@ -1,0 +1,11 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout
+j1010_1.mm,77,2445,3935,17,Optimal,59.55,No
+j1010_10.mm,80,2535,4055,17,Optimal,52.35,No
+j1010_2.mm,80,2532,4061,24,Optimal,61.04,No
+j1010_3.mm,81,2549,4076,21,Optimal,53.36,No
+j1010_4.mm,81,2564,4121,15,Optimal,53.66,No
+j1010_5.mm,77,2433,3911,24,Optimal,47.78,No
+j1010_6.mm,79,2521,4043,18,Optimal,61.90,No
+j1010_7.mm,81,2570,3984,15,Optimal,53.71,No
+j1010_8.mm,76,2416,3745,15,Optimal,43.91,No
+j1010_9.mm,70,2233,3444,10,Optimal,39.59,No
