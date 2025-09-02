@@ -1,13 +1,33 @@
-# ================== BATCH RUNNER (Z3, chống tràn RAM) ==================
+# ================== BATCH RUNNER (Z3, chống tràn RAM, GCS upload) ==================
 from pathlib import Path
 from typing import Dict, List, Tuple
 import time, csv, gc, os
 from datetime import datetime
 from z3 import Bool, Int, If, Or, And, Sum, Optimize, Implies, sat, set_param
-
-# ---- đọc dữ liệu .mm (giữ nguyên reader của bạn) ----
 from MRCPSP_Basic import MRCPSPDataReader
 import resource
+import re
+from bisect import bisect_left, bisect_right
+
+
+# --- GCS (tùy chọn) ---
+try:
+    from google.cloud import storage  # pip install google-cloud-storage
+    _GCS_AVAILABLE = True
+except Exception:
+    storage = None
+    _GCS_AVAILABLE = False
+
+def _upload_to_gcs(bucket_name: str, local_file: Path, dest_blob: str):
+    """Upload 1 file lên GCS: gs://bucket_name/dest_blob"""
+    if not _GCS_AVAILABLE:
+        print("google-cloud-storage chưa được cài. Bỏ qua upload.")
+        return
+    client = storage.Client()  # dùng ADC hoặc GOOGLE_APPLICATION_CREDENTIALS
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(dest_blob)
+    blob.upload_from_filename(str(local_file))
+    print(f"  ☁ Uploaded to gs://{bucket_name}/{dest_blob}")
 
 def _worker_unpack(arg_tuple):
     return _worker_entry(*arg_tuple)
@@ -57,13 +77,11 @@ def _rtw_indices_for(i, o, tau, ES, LS, dur):
 
 def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: int | None = None):
     """
-    One-shot Optimize (minimize M) — nhanh như chạy lẻ.
+    One-shot Optimize (minimize M).
     Trả về dict: instance, horizon, variables, clauses, makespan, status, Solve time, timeout
     """
-    # (tuỳ chọn) set soft limit cho Z3
     if memory_limit_mb:
         try:
-            from z3 import set_param
             set_param('memory_max_size', int(memory_limit_mb) * 1024 * 1024)  # bytes
         except Exception:
             pass
@@ -84,8 +102,6 @@ def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: i
     S = {i: Int(f"S_{i}") for i in range(1, J + 1)}
     M = Int("M"); opt.add(M >= 0)
 
-    # Helper
-    def bool_sum(lits): return Sum([If(l, 1, 0) for l in lits])
     def dur_of(i): return Sum([If(sm[i][o], dur[i][o], 0) for o in range(len(dur[i]))])
 
     # (3.1) source start=0 (nếu job 1 là nguồn)
@@ -106,7 +122,7 @@ def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: i
         for o in range(len(dur[i])):
             opt.add(sm[i][o] == Or([x[i][t][o] for t in range(ES[i], LS[i] + 1)]))
 
-    # (3.5) Exactly-One cho mode (Sum == 1) — hoặc có thể bỏ vì đã suy ra từ x
+    # (3.5) Exactly-One cho mode (Sum == 1)
     for i in range(1, J + 1):
         mos = [sm[i][o] for o in range(len(dur[i]))]
         if mos:
@@ -124,8 +140,7 @@ def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: i
         for j2 in prec.get(i, []):
             opt.add(S[j2] >= S[i] + dur_of(i))
 
-    # (3.6) renewable: theo RTW ở mọi τ ∈ [0..H]
-    # (one-shot như bản chạy lẻ — nhanh rồi; nếu muốn thêm boost, có thể dùng τ ∈ [0..M] với M là upper bound heur.)
+    # (3.6) renewable: RTW ở mọi τ ∈ [0..H]
     for k in range(R):
         for tau in range(0, H + 1):
             terms = []
@@ -141,23 +156,23 @@ def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: i
             if terms:
                 opt.add(Sum(terms) <= R_cap[k])
 
-    # (3.7) nonrenewable với EO-reduction (§4.4.1/§3.2.5)
+    # (3.7) nonrenewable với EO-reduction
     for k in range(N):
         mins = {i: (min(reqN[i][o][k] for o in range(len(reqN[i]))) if len(reqN[i]) else 0)
                 for i in range(1, J + 1)}
         Bk_reduced = N_cap[k] - sum(mins.values())
         if Bk_reduced < 0:
             opt.add(False)
-            continue
-        terms = []
-        for i in range(1, J + 1):
-            for o in range(len(reqN[i])):
-                delta = reqN[i][o][k] - mins[i]
-                if delta > 0:
-                    terms.append(If(sm[i][o], delta, 0))
-        opt.add(Sum(terms) <= Bk_reduced)
+        else:
+            terms = []
+            for i in range(1, J + 1):
+                for o in range(len(reqN[i])):
+                    delta = reqN[i][o][k] - mins[i]
+                    if delta > 0:
+                        terms.append(If(sm[i][o], delta, 0))
+            opt.add(Sum(terms) <= Bk_reduced)
 
-    # Mục tiêu và ràng buộc makespan
+    # Mục tiêu và makespan
     for i in range(1, J + 1):
         opt.add(M >= S[i] + dur_of(i))
     opt.minimize(M)
@@ -177,7 +192,6 @@ def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: i
 
     m = opt.model()
     ms = m[M].as_long()
-
     return {
         "instance": Path(mm_path).name,
         "horizon": reader.get_horizon(),
@@ -188,7 +202,6 @@ def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: i
         "Solve time": f"{solve_time:.2f}",
         "timeout": "No" if solve_time < timeout_s else "Yes",
     }
-
 
 # ---- chạy 1 instance trong PROCESS RIÊNG để chống tràn RAM ----
 def _worker_entry(mm_path: str, timeout_s: int, memory_limit_mb: int | None):
@@ -202,12 +215,16 @@ def _worker_entry(mm_path: str, timeout_s: int, memory_limit_mb: int | None):
     return row
 
 def run_batch_smt(
-    data_dir="data/j10",
-    out_dir="result/j10",
+    data_dir="data/j30",
+    out_dir="result/j30",
     timeout_s=600,
     batch_flush=10,
-    process_isolation=True,     # chống tràn RAM: chạy mỗi instance trong 1 process
-    memory_limit_mb=None        # soft limit cho Z3 (MB)
+    process_isolation=True,
+    memory_limit_mb=None,
+    gcs_bucket: str | None = None,
+    gcs_prefix: str | None = "result/j30",
+    start_file: str | None = None,   # <-- thêm
+    end_file: str | None = None      # <-- thêm
 ):
     data_path = Path(data_dir)
     out_path = Path(out_dir)
@@ -219,28 +236,74 @@ def run_batch_smt(
     fields = ["instance", "horizon", "variables", "clauses",
               "makespan", "status", "Solve time", "timeout"]
 
-    mm_files = sorted(data_path.glob("*.mm"))
-    print(f"Found {len(mm_files)} instances in {data_path}")
+    # Lấy tất cả file .mm rồi sắp theo (block, inst)
+    all_files = list(data_path.glob("*.mm"))
+
+    def parse_name(name: str):
+        """j3010_1.mm -> (1010, 1); trả None nếu không khớp"""
+        m = re.match(r'^j(\d{4})_(\d+)\.mm$', name, flags=re.IGNORECASE)
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)))
+
+    items = []
+    for p in all_files:
+        key = parse_name(p.name)
+        if key is not None:
+            items.append((key, p))
+
+    # Sắp theo (block, inst)
+    items.sort(key=lambda x: x[0])
+
+    # Nếu không truyền start/end: lấy hết
+    lo_key = parse_name(start_file) if start_file else None
+    hi_key = parse_name(end_file) if end_file else None
+
+    keys = [k for (k, _) in items]
+    lo = bisect_left(keys, lo_key) if lo_key is not None else 0
+    hi = bisect_right(keys, hi_key) if hi_key is not None else len(items)
+
+    # Cắt khoảng (bao gồm cả end_file)
+    items = items[lo:hi]
+
+    mm_files = [p for (_, p) in items]
+    print(f"Found {len(mm_files)} instances in {data_path} "
+          f"{'(range ' + start_file + ' .. ' + end_file + ')' if (start_file or end_file) else ''}")
 
     # ghi header
     with csv_file.open("w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=fields).writeheader()
 
+    # upload header (file rỗng) lên GCS
+    if gcs_bucket:
+        dest_blob = f"{gcs_prefix.rstrip('/')}/{csv_file.name}" if gcs_prefix else csv_file.name
+        try:
+            _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
+        except Exception as e:
+            print(f"  ⚠ Không thể upload header lên GCS: {e}")
+
     results = []
     if process_isolation:
         import multiprocessing as mp
         ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=1) as pool:
+        # Reset process con mỗi task để không dồn RAM lâu dài
+        with ctx.Pool(processes=1, maxtasksperchild=1) as pool:
             args = [(str(mm), timeout_s, memory_limit_mb) for mm in mm_files]
             for idx, row in enumerate(pool.imap_unordered(_worker_unpack, args), start=1):
                 results.append(row)
                 print(f"[{idx}/{len(mm_files)}] {row['instance']} -> {row['status']} (ms={row.get('makespan', '')})")
+
                 if idx % batch_flush == 0:
                     with csv_file.open("a", newline="", encoding="utf-8") as f:
                         csv.DictWriter(f, fieldnames=fields).writerows(results[-batch_flush:])
                     print(f"  ✓ Đã lưu tạm {batch_flush} dòng vào {csv_file}")
+
+                    if gcs_bucket:
+                        try:
+                            _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
+                        except Exception as e:
+                            print(f"  ⚠ Không thể upload batch lên GCS: {e}")
     else:
-        # chạy inline (nhanh hơn) nhưng nhớ dọn RAM
         for idx, mm in enumerate(mm_files, start=1):
             print(f"[{idx}/{len(mm_files)}] Solving {mm.name} ...")
             row = solve_one_instance_z3(str(mm), timeout_s=timeout_s, memory_limit_mb=memory_limit_mb)
@@ -251,7 +314,12 @@ def run_batch_smt(
                     csv.DictWriter(f, fieldnames=fields).writerows(results[-batch_flush:])
                 print(f"  ✓ Đã lưu tạm {batch_flush} dòng vào {csv_file}")
 
-            # dọn dẹp
+                if gcs_bucket:
+                    try:
+                        _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
+                    except Exception as e:
+                        print(f"  ⚠ Không thể upload batch lên GCS: {e}")
+
             gc.collect()
 
     # ghi phần còn lại
@@ -261,16 +329,29 @@ def run_batch_smt(
             csv.DictWriter(f, fieldnames=fields).writerows(results[-rem:])
         print(f"  ✓ Đã lưu phần còn lại ({rem} dòng) vào {csv_file}")
 
+    # upload lần cuối
+    if gcs_bucket:
+        try:
+            _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
+        except Exception as e:
+            print(f"  ⚠ Không thể upload lần cuối lên GCS: {e}")
+
     print(f"\nHoàn tất. Kết quả lưu tại: {csv_file}")
+    if gcs_bucket:
+        print(f"  Và tại: gs://{gcs_bucket}/{dest_blob}")
     return csv_file
 
 if __name__ == "__main__":
-    # Ví dụ chạy batch giống j10
+    # Ví dụ chạy batch giống j30, có upload GCS:
     run_batch_smt(
-        data_dir="data/j10",
-        out_dir="result/j10",
+        data_dir="data/j30",
+        out_dir="result/j30/part2",
         timeout_s=600,
         batch_flush=10,
-        process_isolation=True,   # True để chống tràn RAM
-        memory_limit_mb=8192      # tuỳ chọn
+        process_isolation=True,   # chống tràn RAM
+        memory_limit_mb=8192,     # tuỳ chọn
+        gcs_bucket="mrcpsp",      # <-- đổi bucket của bạn
+        gcs_prefix="result/j30/part2",   # thư mục trên GCS
+        start_file="j303_1.mm",   # <-- thêm
+        end_file= "j309_9.mm"     # <-- thêm
     )
