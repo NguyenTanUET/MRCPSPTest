@@ -548,24 +548,75 @@ class MRCPSPBlockBasedStaircase:
                     self.cnf.extend(pb_constraint)
 
     def add_nonrenewable_resource_constraints(self):
-        """Non-renewable resource constraints"""
+        """
+        Non-renewable with EO-reduction (4.4.1/3.2.5) + fallback:
+          - m_i = min_o b_{iok}
+          - B'_k = B_k - sum_i m_i
+          - sum delta_{iok} * sm_{io} <= B'_k, where delta = max(0, b_{iok} - m_i)
+          - if B'_k < 0  -> fallback to plain PB: sum b_{iok} * sm_{io} <= B_k
+        """
         for k in range(self.nonrenewable_resources):
-            resource_vars = []
-            resource_weights = []
+            idx = self.renewable_resources + k  # cột non-renewable k trong vector yêu cầu
 
+            # Tính m_i = min_o b_{iok} (mặc định 0 nếu job không có mode)
+            mins_per_job = {}
             for j in range(1, self.jobs + 1):
+                vals = []
                 for m in range(len(self.job_modes[j])):
-                    resource_idx = self.renewable_resources + k
-                    if len(self.job_modes[j][m][1]) > resource_idx:
-                        resource_req = self.job_modes[j][m][1][resource_idx]
-                        if resource_req > 0:
-                            resource_vars.append(self.sm_vars[j][m])
-                            resource_weights.append(resource_req)
+                    vec = self.job_modes[j][m][1]
+                    v = vec[idx] if len(vec) > idx else 0
+                    vals.append(0 if v is None else int(v))
+                mins_per_job[j] = min(vals) if vals else 0
 
-            if resource_vars:
-                pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                           self.N_capacity[k], vpool=self.vpool)
-                self.cnf.extend(pb_constraint)
+            sum_min = sum(mins_per_job.values())
+            Bk = self.N_capacity[k]
+            Bk_reduced = Bk - sum_min
+
+            # Xây lists biến & trọng số theo 2 phương án
+            def _plain_pb_lists():
+                resource_vars, resource_weights = [], []
+                for j in range(1, self.jobs + 1):
+                    for m in range(len(self.job_modes[j])):
+                        vec = self.job_modes[j][m][1]
+                        v = vec[idx] if len(vec) > idx else 0
+                        v = 0 if v is None else int(v)
+                        if v > 0:
+                            resource_vars.append(self.sm_vars[j][m])
+                            resource_weights.append(v)
+                return resource_vars, resource_weights
+
+            def _eo_pb_lists():
+                resource_vars, resource_weights = [], []
+                for j in range(1, self.jobs + 1):
+                    m_i = mins_per_job[j]
+                    for m in range(len(self.job_modes[j])):
+                        vec = self.job_modes[j][m][1]
+                        v = vec[idx] if len(vec) > idx else 0
+                        v = 0 if v is None else int(v)
+                        delta = v - m_i
+                        if delta > 0:
+                            resource_vars.append(self.sm_vars[j][m])
+                            resource_weights.append(delta)
+                return resource_vars, resource_weights
+
+            if Bk_reduced < 0:
+                # Fallback an toàn: dùng PB gốc để tránh UNSAT giả
+                resource_vars, resource_weights = _plain_pb_lists()
+                if resource_vars:
+                    pb = PBEnc.atmost(lits=resource_vars,
+                                      weights=resource_weights,
+                                      bound=Bk,
+                                      vpool=self.vpool)
+                    self.cnf.extend(pb)
+            else:
+                # EO-reduction chuẩn
+                resource_vars, resource_weights = _eo_pb_lists()
+                if resource_vars:
+                    pb = PBEnc.atmost(lits=resource_vars,
+                                      weights=resource_weights,
+                                      bound=Bk_reduced,
+                                      vpool=self.vpool)
+                    self.cnf.extend(pb)
 
     def add_makespan_constraint(self, makespan):
         """Makespan constraint"""

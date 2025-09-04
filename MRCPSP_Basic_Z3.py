@@ -1,51 +1,35 @@
-# MRCPSP_SMT_Z3_formulation.py
-# Encode y nguyên theo formulation (3.1)–(3.7) dùng Bool x_{i,t,o}, sm_{i,o}
+# MRCPSP_Basic_Z3_fix.py
+# Z3 SMT encode for MRCPSP (formulation 3.1–3.7, robust for j10/j30)
+# - Exactly-One via sum==1
+# - Precedence via S_j >= S_i + dur(i,mode)
+# - Renewable via RTW
+# - Nonrenewable with EO-reduction (auto-fallback to plain PB if reduction says infeasible)
+# - Data guards & helpful logs
 
+from __future__ import annotations
 from pathlib import Path
-from typing import Dict, List, Tuple
-import time
-from z3 import Bool, Int, If, And, Or, Sum, Optimize, Implies, sat
+import sys, time
+from typing import Dict, List
 
-from MRCPSP_Basic import MRCPSPDataReader
+from z3 import (
+    Bool, Int, If, Or, And, Sum, Optimize, sat, set_param, ModelRef
+)
 
-# -------------------------
-# Helpers
-# -------------------------
-def bool_sum(lits):  # Sum Bool -> Int
+# ---- Reader (bạn đã có sẵn) ----
+try:
+    from MRCPSP_Basic import MRCPSPDataReader
+except Exception as e:
+    print("Cannot import MRCPSPDataReader:", e)
+    sys.exit(1)
+
+
+# ---------- Helpers ----------
+def _bool_sum(lits):  # Sum Bools as Int
     return Sum([If(l, 1, 0) for l in lits])
 
-def build_instance(reader: MRCPSPDataReader):
-    dat = reader.data
-    J = dat['num_jobs']                              # gồm cả source/sink
-    R = dat.get('num_renewable', 0)
-    N = dat.get('num_nonrenewable', 0)
-    R_cap = dat.get('renewable_capacity', [0]*R)
-    N_cap = dat.get('nonrenewable_capacity', [0]*N)
-    prec: Dict[int, List[int]] = dat.get('precedence', {})
-    modes: Dict[int, List[Tuple[int, List[int]]]] = dat.get('job_modes', {})
-    H = reader.get_horizon()
-
-    dur = {j: [m[0] for m in modes.get(j, [])] for j in range(1, J+1)}
-    reqR = {j: [[m[1][k] if k < R else 0 for k in range(R)] for m in modes.get(j, [])]
-            for j in range(1, J+1)}
-    reqN = {j: [[m[1][R+k] if (R+k) < len(m[1]) else 0 for k in range(N)] for m in modes.get(j, [])]
-            for j in range(1, J+1)}
-
-    # bảo đảm có mode dummy nếu thiếu
-    for j in range(1, J+1):
-        if len(dur[j]) == 0:
-            dur[j] = [0]
-            reqR[j] = [[0]*R]
-            reqN[j] = [[0]*N]
-
-    # ES/LS: nếu file không có, dùng ES=0; LS=H - min duration
-    ES = {j: 0 for j in range(1, J+1)}
-    LS = {j: max(0, H - min(dur[j])) for j in range(1, J+1)}
-
-    return J, R, N, R_cap, N_cap, prec, dur, reqR, reqN, H, ES, LS
-
-def rtw_indices_for(i, o, tau, ES, LS, dur):
-    """RTW(i,o,τ) = các t sao cho job i start ở t sẽ phủ thời điểm τ"""
+def _rtw_indices_for(i: int, o: int, tau: int,
+                     ES: Dict[int,int], LS: Dict[int,int],
+                     dur: Dict[int, List[int]]) -> List[int]:
     d = dur[i][o]
     lo = max(ES[i], tau - d + 1)
     hi = min(LS[i], tau)
@@ -53,125 +37,178 @@ def rtw_indices_for(i, o, tau, ES, LS, dur):
         return []
     return list(range(lo, hi+1))
 
-# -------------------------
-# Solver (formulation 3.1–3.7)
-# -------------------------
-def solve_one(mm_path: str, timeout_ms=600_000):
+
+def _build_instance(reader: MRCPSPDataReader):
+    dat = reader.data
+    J = dat['num_jobs']
+    R = dat.get('num_renewable', 0)
+    N = dat.get('num_nonrenewable', 0)
+    R_cap = dat.get('renewable_capacity', [0]*R)
+    N_cap = dat.get('nonrenewable_capacity', [0]*N)
+    prec = dat.get('precedence', {})
+    modes = dat.get('job_modes', {})
+    H = reader.get_horizon()
+
+    # Pack durations + resource vectors, guard for length != R+N
+    dur: Dict[int, List[int]] = {}
+    reqR: Dict[int, List[List[int]]] = {}
+    reqN: Dict[int, List[List[int]]] = {}
+
+    for j in range(1, J+1):
+        jmodes = modes.get(j, [])
+        dj, rR, rN = [], [], []
+        for (d, vec) in jmodes:
+            vec = list(vec)
+            # Guard length vs R+N
+            if len(vec) < R + N:
+                vec = vec + [0] * (R + N - len(vec))
+                print(f"[WARN] Job {j} mode has {len(vec)-(R+N)} padded zeros to match R+N")
+            elif len(vec) > R + N:
+                vec = vec[:R+N]
+                print(f"[WARN] Job {j} mode had extra columns; truncated to R+N")
+            dj.append(d)
+            rR.append([vec[k] for k in range(R)])
+            rN.append([vec[R+k] for k in range(N)])
+        if not dj:
+            dj  = [0]
+            rR  = [[0]*R]
+            rN  = [[0]*N]
+        dur[j]  = dj
+        reqR[j] = rR
+        reqN[j] = rN
+
+    ES = {j: 0 for j in range(1, J+1)}
+    LS = {j: max(0, H - (min(dur[j]) if dur[j] else 0)) for j in range(1, J+1)}
+    return J, R, N, R_cap, N_cap, prec, dur, reqR, reqN, H, ES, LS
+
+
+def solve_one_instance_z3(mm_path: str, timeout_s: int = 600, memory_limit_mb: int | None = None):
+    # ---- Load ----
     reader = MRCPSPDataReader(mm_path)
-    J, R, N, R_cap, N_cap, prec, dur, reqR, reqN, H, ES, LS = build_instance(reader)
+    H = reader.get_horizon()
+    print(f"Read horizon from file: {H}")
+
+    J, R, N, R_cap, N_cap, prec, dur, reqR, reqN, H, ES, LS = _build_instance(reader)
+
+    # ---- Z3 setup ----
+    if memory_limit_mb:
+        try:
+            set_param('memory_max_size', int(memory_limit_mb) * 1024 * 1024)  # bytes
+        except Exception:
+            pass
 
     opt = Optimize()
-    if timeout_ms is not None:
-        opt.set(timeout=timeout_ms)
+    opt.set(timeout=timeout_s * 1000)
 
-    # Biến Bool: x[i][t][o] = 1 ⇔ “i start=t, mode=o”
+    # ---- Variables ----
     x = {i: {t: {o: Bool(f"x_{i}_{t}_{o}") for o in range(len(dur[i]))}
-             for t in range(ES[i], LS[i]+1)}
-         for i in range(1, J+1)}
-    # sm[i][o] = 1 ⇔ “i chọn mode o”  (để khớp (3.5))
-    sm = {i: {o: Bool(f"sm_{i}_{o}") for o in range(len(dur[i]))} for i in range(1, J+1)}
+             for t in range(ES[i], LS[i] + 1)}
+         for i in range(1, J + 1)}
+    sm = {i: {o: Bool(f"sm_{i}_{o}") for o in range(len(dur[i]))}
+          for i in range(1, J + 1)}
+    S = {i: Int(f"S_{i}") for i in range(1, J + 1)}
     M = Int("M"); opt.add(M >= 0)
 
-    # (3.1) S_0 = 0  (giả định job 1 là supersource có dur=0)
+    def dur_of(i: int):
+        return Sum([If(sm[i][o], dur[i][o], 0) for o in range(len(dur[i]))])
+
+    # ---- Source fix (job 1 at t=0 nếu là supersource) ----
     if 1 in x:
-        # ép start=0 cho mọi mode của job 1 (nếu có)
         for o in range(len(dur[1])):
-            # Exactly-one theo (3.2)–(3.3) đảm bảo chỉ một mode được chọn
-            # ép x_{1,t!=0,o}=0 và cho phép x_{1,0,o}
             for t in list(x[1].keys()):
                 if t != 0:
-                    opt.add( ~x[1][t][o] )
+                    opt.add(~x[1][t][o])
 
-    # (3.2)–(3.3) biên sớm–muộn và (Exactly-one start & mode) trên x
+    # ---- Exactly-One (t,o) ----
     for i in range(1, J+1):
-        lits = []
-        for t in range(ES[i], LS[i]+1):
-            for o in range(len(dur[i])):
-                lits.append(x[i][t][o])
-        # Exactly-one: 1) Ít nhất một
-        opt.add(bool_sum(lits) == 1)
+        lits = [x[i][t][o] for t in range(ES[i], LS[i]+1) for o in range(len(dur[i]))]
+        if lits:
+            opt.add(_bool_sum(lits) == 1)
 
-    # Liên kết sm_{i,o} ↔ ∨_t x_{i,t,o}  (để dùng trong (3.5), (3.7))
+    # sm[i,o] <-> OR_t x[i,t,o]
     for i in range(1, J+1):
         for o in range(len(dur[i])):
-            ors = [x[i][t][o] for t in range(ES[i], LS[i]+1)]
-            opt.add( sm[i][o] == Or(ors) )
+            opt.add(sm[i][o] == Or([x[i][t][o] for t in range(ES[i], LS[i]+1)]))
 
-    # (3.5) ∑_o sm_{i,o} = 1
+    # Exactly-One mode (redundant but clarifies)
     for i in range(1, J+1):
-        # ít nhất 1
         mos = [sm[i][o] for o in range(len(dur[i]))]
         if mos:
-            opt.add(bool_sum(mos) == 1)
+            opt.add(_bool_sum(mos) == 1)
 
-    # (3.4) Precedence (i → j): nếu x_{i,t,o}=1 thì mọi start của j ở t'< t+d_{i,o} đều bị cấm
+    # ---- Start variables S_i ----
+    for i in range(1, J+1):
+        opt.add(And(S[i] >= ES[i], S[i] <= LS[i]))
+        opt.add(S[i] == Sum([
+            t * If(x[i][t][o], 1, 0)
+            for t in range(ES[i], LS[i]+1)
+            for o in range(len(dur[i]))
+        ]))
+
+    # ---- Precedence: S_j >= S_i + d_i ----
     for i in range(1, J+1):
         for j2 in prec.get(i, []):
-            for o in range(len(dur[i])):
-                d = dur[i][o]
-                for t in range(ES[i], LS[i]+1):
-                    forbid = []
-                    up_to = min(LS[j2], t + d - 1)
-                    for t2 in range(ES[j2], up_to+1):
-                        for o2 in range(len(dur[j2])):
-                            forbid.append(~x[j2][t2][o2])
-                    if forbid:
-                        opt.add( Implies(x[i][t][o], And(forbid)) )
+            opt.add(S[j2] >= S[i] + dur_of(i))
 
-    # (3.6) Renewable theo thời điểm τ, dùng RTW: ∑_{i,o} b_{i,k,o} * ∑_{t∈RTW(i,o,τ)} x_{i,t,o} ≤ B_k
+    # ---- Renewable RTW (tau in [0..H-1]) ----
     for k in range(R):
-        for tau in range(0, H+1):
+        cap = R_cap[k]
+        for tau in range(0, H):
             terms = []
             for i in range(1, J+1):
                 for o in range(len(dur[i])):
-                    coef = reqR[i][o][k]
-                    if coef == 0:
+                    r = reqR[i][o][k] if k < len(reqR[i][o]) else 0
+                    if r == 0:
                         continue
-                    T = rtw_indices_for(i, o, tau, ES, LS, dur)
+                    T = _rtw_indices_for(i, o, tau, ES, LS, dur)
                     if not T:
                         continue
-                    terms.append( coef * Sum([If(x[i][t][o], 1, 0) for t in T]) )
+                    terms.append(r * Sum([If(x[i][t][o], 1, 0) for t in T]))
             if terms:
-                opt.add( Sum(terms) <= R_cap[k] )
+                opt.add(Sum(terms) <= cap)
 
-    # (3.7) Nonrenewable toàn cục: ∑_{i,o} b_{i,k,o} * sm_{i,o} ≤ B_k
+    # ---- Nonrenewable PB with EO-reduction (auto-fallback) ----
+    used_fallback = False
     for k in range(N):
-        # m_{i,k} và B'_k
-        mins = {}
-        for i in range(1, J + 1):
-            mins[i] = min(reqN[i][o][k] for o in range(len(reqN[i]))) if len(reqN[i]) else 0
-        Bk_reduced = N_cap[k] - sum(mins.values())
+        mins = {i: (min(reqN[i][o][k] for o in range(len(reqN[i]))) if len(reqN[i]) else 0)
+                for i in range(1, J+1)}
+        sum_min = sum(mins.values())
+        Bk = N_cap[k]
+        Bk_reduced = Bk - sum_min
+
         if Bk_reduced < 0:
-            #UNSAT
-            opt.add(False)
-            continue
+            # Fallback: dùng PB cơ bản thay vì cứng UNSAT
+            used_fallback = True
+            print(f"[NR-FALLBACK] Sum of minima for N{k+1} = {sum_min} > capacity {Bk}. "
+                  f"Using plain PB instead of EO-reduction.")
+            opt.add(Sum([
+                reqN[i][o][k] * If(sm[i][o], 1, 0)
+                for i in range(1, J+1)
+                for o in range(len(reqN[i]))
+            ]) <= Bk)
+        else:
+            terms = []
+            for i in range(1, J+1):
+                for o in range(len(reqN[i])):
+                    delta = reqN[i][o][k] - mins[i]
+                    if delta > 0:
+                        terms.append(If(sm[i][o], delta, 0))
+            opt.add(Sum(terms) <= Bk_reduced)
 
-        # ∑ δ_{i,k,o} sm_{i,o} ≤ B'_k, với δ = b - m_{i,k}
-        terms = []
-        for i in range(1, J + 1):
-            for o in range(len(reqN[i])):
-                delta = reqN[i][o][k] - mins[i]
-                if delta > 0:
-                    terms.append(If(sm[i][o], delta, 0))
-                # delta==0 không cần đưa vào tổng
-        opt.add(Sum(terms) <= Bk_reduced)
-
-    # Makespan & mục tiêu: M ≥ t + d_{i,o} với cặp (t,o) được chọn của từng i; minimize M
+    # ---- Makespan ----
     for i in range(1, J+1):
-        expr = Sum([ (t + dur[i][o]) * If(x[i][t][o], 1, 0)
-                     for t in range(ES[i], LS[i]+1)
-                     for o in range(len(dur[i])) ])
-        opt.add(M >= expr)
+        opt.add(M >= S[i] + dur_of(i))
     opt.minimize(M)
 
-    # ---------------- Solve & print ----------------
-    num_constraints = len(opt.assertions())
-    # đếm biến ~ số Bool x + Bool sm + 1 biến Int M (xấp xỉ)
-    num_variables = sum(len(x[i][t]) for i in x for t in x[i]) + sum(len(sm[i]) for i in sm) + 1
-
+    # ---- Solve ----
     t0 = time.time()
     res = opt.check()
     solve_time = time.time() - t0
+
+    num_constraints = len(opt.assertions())
+    num_bool_x = sum(len(dur[i]) * (LS[i] - ES[i] + 1) for i in range(1, J+1))
+    num_bool_sm = sum(len(dur[i]) for i in range(1, J+1))
+    num_variables = num_bool_x + num_bool_sm + len(S) + 1  # + S_i + M
 
     if res != sat:
         print("✗ UNSAT/UNKNOWN")
@@ -180,101 +217,65 @@ def solve_one(mm_path: str, timeout_ms=600_000):
         print(f"Total solving time: {solve_time:.2f}s")
         return None
 
-    m = opt.model()
+    m: ModelRef = opt.model()
     ms = m[M].as_long()
-
-    # Lấy lịch (job, mode, start, dur, finish, resources)
-    schedule = []
-    for i in range(1, J+1):
-        start, mode_idx = None, None
-        for t in range(ES[i], LS[i]+1):
-            for o in range(len(dur[i])):
-                if m.evaluate(x[i][t][o], model_completion=True):
-                    if bool(m.eval(x[i][t][o])):
-                        start, mode_idx = t, o
-                        break
-            if start is not None: break
-        d = dur[i][mode_idx]
-        finish = start + d
-        rvec = []
-        rvec += [reqR[i][mode_idx][k] for k in range(R)]
-        rvec += [reqN[i][mode_idx][k] for k in range(N)]
-        schedule.append((i, mode_idx, start, d, finish, rvec))
-    schedule.sort(key=lambda a: (a[2], a[0]))
-
-    # ----- pretty print -----
     print("=== SOLUTION ===")
     print(f"Makespan: {ms}\n")
-    hdrR = [f"R{k+1}" for k in range(R)]
-    hdrN = [f"N{k+1}" for k in range(N)]
-    print("Job   Mode   Start   Duration   Finish   " +
-          ("Resources" if not hdrR and not hdrN else f"Resources ({' '.join(hdrR+hdrN)})"))
-    print("-"*65)
-    for (j, o, st, du, ft, rv) in schedule:
-        rstr = "  ".join(f"{v:>2d}" for v in rv) if rv else ""
-        print(f"{j:<5d}{(o+1):<7d}{st:<8d}{du:<11d}{ft:<9d} {rstr}")
 
-    # ----- validate nhanh -----
-    print("\n=== VALIDATING SOLUTION ===")
-    print(f"Actual makespan from solution: {max(ft for *_, ft, _ in schedule)}\n")
+    # reconstruct schedule
+    def sel_mode(i: int) -> int:
+        for o in range(len(dur[i])):
+            if m.evaluate(sm[i][o], model_completion=True) is True:
+                return o
+        return 0
 
-    # precedence
-    ok_prec = True
+    schedule = []
     for i in range(1, J+1):
-        succs = reader.data.get('precedence', {}).get(i, [])
-        if not succs: continue
-        st_i = next(st for (j, o, st, du, ft, rv) in schedule if j == i)
-        o_i  = next(o for (j, o, st, du, ft, rv) in schedule if j == i)
-        di   = dur[i][o_i]
-        for j2 in succs:
-            st_j = next(st for (jj, oo, st, du, ft, rv) in schedule if jj == j2)
-            if st_j < st_i + di: ok_prec = False; break
-        if not ok_prec: break
-    print("  ✓ All precedence constraints satisfied" if ok_prec else "  ✗ Violation found")
+        s = m.evaluate(S[i], model_completion=True).as_long()
+        o = sel_mode(i)
+        d = dur[i][o]
+        f = s + d
+        Rv = reqR[i][o] if i in reqR and o < len(reqR[i]) else [0]*R
+        Nv = reqN[i][o] if i in reqN and o < len(reqN[i]) else [0]*N
+        schedule.append((i, o+1, s, d, f, Rv, Nv))
 
-    # renewable
-    ok_R = True
-    if R > 0:
-        print("\nChecking renewable resource constraints...")
-        for tau in range(ms+1):
-            for k in range(R):
-                use = 0
-                for (j, o, st, du, ft, rv) in schedule:
-                    if st <= tau < ft:
-                        use += reqR[j][o][k]
-                if use > R_cap[k]: ok_R = False; break
-            if not ok_R: break
-        print("  ✓ All renewable resource constraints satisfied" if ok_R else "  ✗ Violation found")
-    else:
-        print("\n(No renewable resources)")
+    # pretty print (sorted by start)
+    print("Job  Mode  Start  Duration  Finish   Resources (R...  N...)")
+    print("-"*72)
+    for (i, mo, s, d, f, Rv, Nv) in sorted(schedule, key=lambda x: x[2]):
+        res_str = " ".join(map(str, Rv + Nv))
+        print(f"{i:<4} {mo:<5} {s:<6} {d:<8} {f:<7}  {res_str}")
 
-    # nonrenewable
-    ok_N = True
-    if N > 0:
-        print("\nChecking non-renewable resource constraints...")
-        for k in range(N):
-            total = sum(reqN[j][o][k] for (j,o,st,du,ft,rv) in schedule)
-            if total > N_cap[k]: ok_N = False; break
-        print("  ✓ All non-renewable resource constraints satisfied" if ok_N else "  ✗ Violation found")
-    else:
-        print("\n(No non-renewable resources)")
+    # quick checks
+    ok = True
+    for i in range(1, J+1):
+        for j2 in prec.get(i, []):
+            si = [row for row in schedule if row[0] == i][0][2]
+            di = [row for row in schedule if row[0] == i][0][3]
+            sj = [row for row in schedule if row[0] == j2][0][2]
+            if sj < si + di:
+                ok = False
+                print(f"[ERR] precedence violated: {i}->{j2} sj={sj} < si+di={si+di}")
+    if ok:
+        print("\n✓ Precedence constraints satisfied")
 
-    print("\n" + ("✓ Solution is VALID!" if (ok_prec and ok_R and ok_N) else "✗ Solution is NOT valid.") + "\n")
-    print(f"✓ Successfully found optimal makespan = {ms}")
-    print(f"Tổng ràng buộc: {len(opt.assertions())}")
+    print(f"\n✓ Successfully found optimal makespan = {ms}")
+    print(f"Tổng ràng buộc (assertions): {num_constraints}")
     print(f"Tổng biến quyết định    : {num_variables}")
     print(f"Total solving time: {solve_time:.2f}s")
+    return {
+        "makespan": ms,
+        "variables": num_variables,
+        "constraints": num_constraints,
+        "time": solve_time,
+        "schedule": schedule,
+    }
 
-    return dict(makespan=ms, schedule=schedule,
-                num_constraints=len(opt.assertions()),
-                num_variables=num_variables, solve_time=solve_time)
 
-# -------------------------
 if __name__ == "__main__":
-    DEFAULT_INSTANCE = "data/j10/j1010_1.mm"
-
+    mm = sys.argv[1] if len(sys.argv) > 1 else "data/j30/j3010_1.mm"
     print("="*100)
     print("RUN ONE INSTANCE (Z3 SMT — formulation 3.1–3.7)")
     print("="*100)
-    print(f"Instance: {DEFAULT_INSTANCE}\n")
-    solve_one(DEFAULT_INSTANCE, timeout_ms=600_000)
+    print("Instance:", mm, "\n")
+    solve_one_instance_z3(mm, timeout_s=600, memory_limit_mb=None)

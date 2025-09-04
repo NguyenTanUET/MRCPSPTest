@@ -371,19 +371,75 @@ class MRCPSPBlockBasedStaircase:
                     self.cnf.extend(pb)
 
     def add_nonrenewable_resource_constraints(self):
+        """
+        Non-renewable with EO-reduction (4.4.1/3.2.5) + fallback:
+          - m_i = min_o b_{iok}
+          - B'_k = B_k - sum_i m_i
+          - sum delta_{iok} * sm_{io} <= B'_k, where delta = max(0, b_{iok} - m_i)
+          - if B'_k < 0  -> fallback to plain PB: sum b_{iok} * sm_{io} <= B_k
+        """
         for k in range(self.nonrenewable_resources):
-            resource_vars, resource_weights = [], []
+            idx = self.renewable_resources + k  # cột non-renewable k trong vector yêu cầu
+
+            # Tính m_i = min_o b_{iok} (mặc định 0 nếu job không có mode)
+            mins_per_job = {}
             for j in range(1, self.jobs + 1):
+                vals = []
                 for m in range(len(self.job_modes[j])):
-                    idx = self.renewable_resources + k
-                    if len(self.job_modes[j][m][1]) > idx:
-                        req = self.job_modes[j][m][1][idx]
-                        if req > 0:
+                    vec = self.job_modes[j][m][1]
+                    v = vec[idx] if len(vec) > idx else 0
+                    vals.append(0 if v is None else int(v))
+                mins_per_job[j] = min(vals) if vals else 0
+
+            sum_min = sum(mins_per_job.values())
+            Bk = self.N_capacity[k]
+            Bk_reduced = Bk - sum_min
+
+            # Xây lists biến & trọng số theo 2 phương án
+            def _plain_pb_lists():
+                resource_vars, resource_weights = [], []
+                for j in range(1, self.jobs + 1):
+                    for m in range(len(self.job_modes[j])):
+                        vec = self.job_modes[j][m][1]
+                        v = vec[idx] if len(vec) > idx else 0
+                        v = 0 if v is None else int(v)
+                        if v > 0:
                             resource_vars.append(self.sm_vars[j][m])
-                            resource_weights.append(req)
-            if resource_vars:
-                pb = PBEnc.atmost(resource_vars, resource_weights, self.N_capacity[k], vpool=self.vpool)
-                self.cnf.extend(pb)
+                            resource_weights.append(v)
+                return resource_vars, resource_weights
+
+            def _eo_pb_lists():
+                resource_vars, resource_weights = [], []
+                for j in range(1, self.jobs + 1):
+                    m_i = mins_per_job[j]
+                    for m in range(len(self.job_modes[j])):
+                        vec = self.job_modes[j][m][1]
+                        v = vec[idx] if len(vec) > idx else 0
+                        v = 0 if v is None else int(v)
+                        delta = v - m_i
+                        if delta > 0:
+                            resource_vars.append(self.sm_vars[j][m])
+                            resource_weights.append(delta)
+                return resource_vars, resource_weights
+
+            if Bk_reduced < 0:
+                # Fallback an toàn: dùng PB gốc để tránh UNSAT giả
+                resource_vars, resource_weights = _plain_pb_lists()
+                if resource_vars:
+                    pb = PBEnc.atmost(lits=resource_vars,
+                                      weights=resource_weights,
+                                      bound=Bk,
+                                      vpool=self.vpool)
+                    self.cnf.extend(pb)
+            else:
+                # EO-reduction chuẩn
+                resource_vars, resource_weights = _eo_pb_lists()
+                if resource_vars:
+                    pb = PBEnc.atmost(lits=resource_vars,
+                                      weights=resource_weights,
+                                      bound=Bk_reduced,
+                                      vpool=self.vpool)
+                    self.cnf.extend(pb)
 
     def add_makespan_constraint(self, makespan):
         sink_job = self.jobs
@@ -580,6 +636,7 @@ def solve_instance_with_timeout(mm_path, timeout_s=600):
         "status": status,
         "Solve time": f"{total_time:.2f}",
         "timeout": "Yes" if timeout_flag else "No",
+        "error": ""
     }
     return row
 
@@ -605,9 +662,11 @@ def _worker_main():
         row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout)
     except Exception as e:
         tb = traceback.format_exc()
-        row = {"instance": mm_path.name, "horizon": "", "variables": "", "clauses": "",
-               "makespan": "", "status": "Infeasible", "Solve time": "", "timeout": "No",
-               "_error": f"{e}\n{tb}"}
+        row = {"instance": mm_path.name, "horizon": "",
+               "variables": 0, "clauses": 0,
+               "makespan": "", "status": "Error",
+               "Solve time": "0.00", "timeout": "No",
+               "error": f"{e}\n{tb}"}
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -670,8 +729,16 @@ def _run_worker_for_instance(script_path: Path, mm_path: Path, timeout_s: int, t
         except Exception as e:
             print(f"    -> Lỗi đọc JSON: {e}")
 
-    return {"instance": mm_path.name, "horizon": "", "variables": "", "clauses": "",
-            "makespan": "", "status": "Infeasible", "Solve time": "", "timeout": "No"}
+    try:
+        rdr = load_reader(mm_path)
+        hz = rdr.get_horizon()
+    except Exception:
+        hz = ""
+
+    return {"instance": mm_path.name, "horizon": hz, "variables": 0, "clauses": 0,
+            "makespan": "", "status": "Infeasible", "Solve time": "0.00",
+            "timeout": "No", "error": "missing worker JSON"}
+
 
 # ==========================
 #  Chạy hàng loạt & ghi CSV + upload GCS
@@ -700,7 +767,7 @@ def run_batch_j30(
     csv_file = out_path / f"MRCPSP_j30_results_{ts}.csv"
 
     fields = ["instance", "horizon", "variables", "clauses",
-              "makespan", "status", "Solve time", "timeout"]
+              "makespan", "status", "Solve time", "timeout", "error"]
 
     results = []
     mm_files = sorted(data_path.glob("*.mm"))
@@ -708,7 +775,7 @@ def run_batch_j30(
 
     # Ghi header ngay khi tạo file
     with csv_file.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
 
     # Upload header lên GCS
@@ -734,7 +801,7 @@ def run_batch_j30(
         # Ghi theo lô mỗi 10 dòng
         if idx % 10 == 0:
             with csv_file.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
+                writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
                 writer.writerows(results[-10:])
             print(f"  ✓ Đã lưu tạm 10 dòng vào {csv_file}")
 
@@ -750,7 +817,7 @@ def run_batch_j30(
     remainder = len(results) % 10
     if remainder:
         with csv_file.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
             writer.writerows(results[-remainder:])
         print(f"  ✓ Đã lưu phần còn lại ({remainder} dòng) vào {csv_file}")
 
