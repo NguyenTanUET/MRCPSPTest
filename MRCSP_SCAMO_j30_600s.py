@@ -22,7 +22,7 @@ except Exception:
     _GCS_AVAILABLE = False
 
 # ===== NEW: imports cho sandbox subprocess & util =====
-import subprocess, sys, json, os, signal, traceback
+import subprocess, sys, json, os, signal, uuid, traceback
 
 # ==========================
 #  Phần ENCODER
@@ -677,68 +677,73 @@ def _worker_main():
     except Exception:
         pass
 
-def _run_worker_for_instance(script_path: Path, mm_path: Path, timeout_s: int, tmp_dir: Path):
-    """
-    Gọi subprocess: python <script> --worker --mm <mm> --timeout <t> --out <json>
-    - Kill cả process group khi timeout để không treo.
-    - Nếu worker chết/không tạo JSON -> trả fallback Infeasible.
-    """
-    tmp_json = tmp_dir / f"{mm_path.stem}.json"
-    cmd = [sys.executable, str(script_path), "--worker", "--mm", str(mm_path),
-           "--timeout", str(timeout_s), "--out", str(tmp_json)]
+TMP_DIR = Path("tmp_results")  # chỗ chứa JSON tạm
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    preexec = os.setsid if hasattr(os, "setsid") else None  # Linux: tạo process group
+def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
+    """Spawn worker to solve one instance and return a row dict for CSV."""
+    # file duy nhất cho worker này
+    out_final = TMP_DIR / f"{mm_path.stem}__{uuid.uuid4().hex}.json"
+    out_part  = TMP_DIR / (out_final.name + ".part")
 
+    cmd = [
+        sys.executable, "-u",  # -u để unbuffered stdout/stderr
+        __file__,              # chạy lại chính script ở chế độ worker
+        "--as-worker",
+        "--instance", str(mm_path),
+        "--json", str(out_part),
+        "--timeout", str(time_limit),
+    ]
+
+    t0 = time.time()
     try:
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            preexec_fn=preexec
+        cp = subprocess.run(
+            cmd, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        try:
-            out, _ = p.communicate(timeout=timeout_s + 30)
-        except subprocess.TimeoutExpired:
-            if preexec:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except Exception:
-                    pass
-            try:
-                p.kill()
-            except Exception:
-                pass
-            out = ""
     except Exception as e:
-        out = f"[launcher-error] {e}"
+        return {
+            "instance": mm_path.name, "horizon": "",
+            "variables": 0, "clauses": 0,
+            "makespan": "", "status": "Error",
+            "Solve time": f"{time.time()-t0:.2f}",
+            "timeout": "No",
+            "error": f"spawn failed: {e}"
+        }
 
-    if out:
-        for line in out.splitlines()[:5]:
-            print("    [worker] " + line)
-
-    if tmp_json.exists():
+    # worker xong, nếu có .part thì đổi tên thành file chính (atomic rename)
+    if out_part.exists():
         try:
-            with open(tmp_json, "r", encoding="utf-8") as f:
-                row = json.load(f)
+            out_part.replace(out_final)
+        except Exception:
+            pass
+
+    # đọc JSON với retry nhỏ để tránh đọc sớm
+    data = None
+    for _ in range(25):              # ~2.5s tổng cộng
+        if out_final.exists():
             try:
-                tmp_json.unlink()
-            except Exception:
-                pass
-            return row
-        except Exception as e:
-            print(f"    -> Lỗi đọc JSON: {e}")
+                with open(out_final, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                break
+            except json.JSONDecodeError:
+                time.sleep(0.1)
+        else:
+            time.sleep(0.1)
 
-    try:
-        rdr = load_reader(mm_path)
-        hz = rdr.get_horizon()
-    except Exception:
-        hz = ""
+    if data is None:
+        # worker returncode!=0? log stderr vào error
+        err = (cp.stderr or "").strip()
+        return {
+            "instance": mm_path.name, "horizon": "",
+            "variables": 0, "clauses": 0,
+            "makespan": "", "status": "Error",
+            "Solve time": f"{time.time()-t0:.2f}",
+            "timeout": "No",
+            "error": f"missing worker JSON; rc={cp.returncode}; stderr={err[:500]}"
+        }
 
-    return {"instance": mm_path.name, "horizon": hz, "variables": 0, "clauses": 0,
-            "makespan": "", "status": "Infeasible", "Solve time": "0.00",
-            "timeout": "No", "error": "missing worker JSON"}
-
+    return data
 
 # ==========================
 #  Chạy hàng loạt & ghi CSV + upload GCS
