@@ -1014,7 +1014,7 @@ class MRCPSPBlockBasedStaircase:
         return valid
 
 if __name__ == "__main__":
-    DEFAULT_INSTANCE = "data/MMLIB50/J502_2.mm"
+    DEFAULT_INSTANCE = "data/MMLIB50/J50100_1.mm"
     run_one_mmlib50(DEFAULT_INSTANCE, timeout_s=600)
 
 
