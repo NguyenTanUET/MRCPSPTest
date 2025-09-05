@@ -687,11 +687,11 @@ def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
     out_part  = TMP_DIR / (out_final.name + ".part")
 
     cmd = [
-        sys.executable, "-u",  # -u để unbuffered stdout/stderr
-        __file__,              # chạy lại chính script ở chế độ worker
-        "--as-worker",
-        "--instance", str(mm_path),
-        "--json", str(out_part),
+        sys.executable, "-u",
+        __file__,
+        "--worker",
+        "--mm", str(mm_path),
+        "--out", str(out_part),
         "--timeout", str(time_limit),
     ]
 
@@ -795,11 +795,14 @@ def run_batch_j30(
         print(f"[{idx}/{len(mm_files)}] Solving {mm.name} ...")
         try:
             # CHẠY TRONG SUBPROCESS CÁCH LY RAM/exit(0)
-            row = _run_worker_for_instance(script_path, mm, timeout_s, tmp_dir)
+            row = _run_worker_for_instance(mm, timeout_s)
         except Exception as e:
             print(f"  -> Error instance {mm.name}: {e}")
-            row = {"instance": mm.name, "horizon": "", "variables": "", "clauses": "",
-                   "makespan": "", "status": "Infeasible", "Solve time": "", "timeout": "No"}
+            row = {
+                "instance": mm.name, "horizon": "", "variables": 0, "clauses": 0,
+                "makespan": "", "status": "Error", "Solve time": "0.00",
+                "timeout": "No", "error": "parent call error"
+            }
 
         results.append(row)
 
