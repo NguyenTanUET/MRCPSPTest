@@ -765,7 +765,7 @@ def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
 #  Chạy hàng loạt & ghi CSV + upload GCS
 # ==========================
 def run_batch_j30(
-    data_dir="data/j30",
+    data_dir="data/j30_remainder",
     out_dir="result/j30_remainder",
     timeout_s=600,
     gcs_bucket: str | None = None,
@@ -869,7 +869,7 @@ if __name__ == "__main__":
 
     # Chế độ batch (cloud)
     run_batch_j30(
-        data_dir="data/j30",
+        data_dir="data/j30_remainder",
         out_dir="result/j30_remainder",
         timeout_s=600,
         gcs_bucket="mrcpsp",
