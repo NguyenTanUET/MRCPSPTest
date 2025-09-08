@@ -4,7 +4,7 @@ MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
 
 from pysat.pb import PBEnc
 from pysat.formula import CNF, IDPool
-from pysat.solvers import Glucose42
+from pysat.solvers import Cadical195
 import time
 import math
 
@@ -407,21 +407,19 @@ class MRCPSPBlockBasedStaircase:
             for i in range(len(blocks) - 1):
                 self.connect_blocks(blocks[i][0], blocks[i + 1][0])
 
-
     def add_mode_selection_constraints(self):
-        """Exactly one mode for each job"""
         for j in range(1, self.jobs + 1):
             mode_vars = [self.sm_vars[j][m] for m in range(len(self.job_modes[j]))]
-
-            # At least one mode
-            self.cnf.append(mode_vars)
-            self.stats['clauses'] += 1
-
-            # At most one mode
-            for i in range(len(mode_vars)):
-                for k in range(i + 1, len(mode_vars)):
-                    self.cnf.append([-mode_vars[i], -mode_vars[k]])
-                    self.stats['clauses'] += 1
+            if len(mode_vars) <= 1:
+                # 0 hoặc 1 mode thì không cần encode thêm
+                continue
+            # Exactly-One: sum(mode_vars) == 1
+            pb = PBEnc.equals(lits=mode_vars,
+                              weights=[1] * len(mode_vars),
+                              bound=1,
+                              vpool=self.vpool,
+                              encoding=1)
+            self.cnf.extend(pb)
 
     
     def add_precedence_constraints_with_blocks(self):
@@ -544,7 +542,7 @@ class MRCPSPBlockBasedStaircase:
 
                 if resource_vars:
                     pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                                self.R_capacity[k], vpool=self.vpool)
+                                                self.R_capacity[k], vpool=self.vpool, encoding=5)
                     self.cnf.extend(pb_constraint)
 
     def add_nonrenewable_resource_constraints(self):
@@ -606,7 +604,8 @@ class MRCPSPBlockBasedStaircase:
                     pb = PBEnc.atmost(lits=resource_vars,
                                       weights=resource_weights,
                                       bound=Bk,
-                                      vpool=self.vpool)
+                                      vpool=self.vpool,
+                                      encoding=5)
                     self.cnf.extend(pb)
             else:
                 # EO-reduction chuẩn
@@ -615,7 +614,8 @@ class MRCPSPBlockBasedStaircase:
                     pb = PBEnc.atmost(lits=resource_vars,
                                       weights=resource_weights,
                                       bound=Bk_reduced,
-                                      vpool=self.vpool)
+                                      vpool=self.vpool,
+                                      encoding=5)
                     self.cnf.extend(pb)
 
     def add_makespan_constraint(self, makespan):
@@ -691,7 +691,7 @@ class MRCPSPBlockBasedStaircase:
 
         # Solve
         print("Solving SAT instance...")
-        solver = Glucose42()
+        solver = Cadical195()
         solver.append_formula(self.cnf)
 
         start_time = time.time()
@@ -896,7 +896,7 @@ def test_precedence_aware_encoding(test_file=None):
         return None, None
 
     if test_file is None:
-        test_file = "data/j20/j205_7.mm"
+        test_file = "data/j30/j3010_10.mm"
 
     print("=" * 100)
     print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")

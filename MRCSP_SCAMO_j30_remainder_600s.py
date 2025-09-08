@@ -766,10 +766,10 @@ def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
 # ==========================
 def run_batch_j30(
     data_dir="data/j30",
-    out_dir="result/j30",
+    out_dir="result/j30_remainder",
     timeout_s=600,
     gcs_bucket: str | None = None,
-    gcs_prefix: str | None = "result/j30"
+    gcs_prefix: str | None = "result/j30_remainder"
 ):
     """
     Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
@@ -870,8 +870,8 @@ if __name__ == "__main__":
     # Chế độ batch (cloud)
     run_batch_j30(
         data_dir="data/j30",
-        out_dir="result/j30",
+        out_dir="result/j30_remainder",
         timeout_s=600,
         gcs_bucket="mrcpsp",
-        gcs_prefix="result/j30"
+        gcs_prefix="result/j30_remainder"
     )
