@@ -47,8 +47,7 @@ class MRCPSPBlockBasedStaircase:
         self.precedence = mm_reader.data['precedence']
         self.job_modes = mm_reader.data['job_modes']
 
-        # Time windows
-        self.calculate_time_windows()
+        self._preprocess_all()
 
         # Precedence-aware block widths
         self.precedence_widths = {}  # {(pred, succ): width}
@@ -72,6 +71,142 @@ class MRCPSPBlockBasedStaircase:
         }
         self.last_var_count = 0
         self.last_clause_count = 0
+
+    def _remove_infeasible_and_dominated_modes(self):
+        """1) Bỏ mode không khả thi (vượt capacity)  2) Bỏ mode bị chi phối (dominated)."""
+        R = self.renewable_resources
+        new_modes = {}
+        for j, modes in self.job_modes.items():
+            # 1) lọc mode không khả thi
+            feas = []
+            for (dur, req) in modes:
+                ok = True
+                # renewables
+                for r in range(R):
+                    if r < len(req) and req[r] > self.R_capacity[r]:
+                        ok = False;
+                        break
+                # non-renewables
+                if ok:
+                    for k in range(self.nonrenewable_resources):
+                        idx = R + k
+                        if idx < len(req) and req[idx] > self.N_capacity[k]:
+                            ok = False;
+                            break
+                if ok:
+                    feas.append((int(dur), list(map(int, req))))
+            # 2) loại dominated
+            keep = []
+            for a, (da, ra) in enumerate(feas):
+                dominated = False
+                for b, (db, rb) in enumerate(feas):
+                    if a == b: continue
+                    leq_all = (db <= da) and all(rb[i] <= ra[i] for i in range(len(ra)))
+                    strict = (db < da) or any(rb[i] < ra[i] for i in range(len(ra)))
+                    if leq_all and strict:
+                        dominated = True;
+                        break
+                if not dominated:
+                    keep.append((da, ra))
+            # không để rỗng
+            new_modes[j] = keep if keep else feas
+        self.job_modes = new_modes
+
+    def _eo_reduce_nonrenewables_inplace(self):
+        """EO-reduction như trong tài liệu: trừ m_i vào dữ liệu + giảm B_k."""
+        R = self.renewable_resources
+        for k in range(self.nonrenewable_resources):
+            idx = R + k
+            mins = {}
+            for j, modes in self.job_modes.items():
+                vals = [(m[1][idx] if idx < len(m[1]) else 0) for m in modes]
+                mins[j] = min(vals) if vals else 0
+            red = sum(mins.values())
+            # giảm capacity
+            self.N_capacity[k] = max(0, self.N_capacity[k] - red)
+            # trừ m_i trên từng mode
+            for j, modes in self.job_modes.items():
+                mi = mins[j]
+                for t in range(len(modes)):
+                    dur, req = modes[t]
+                    if idx < len(req):
+                        req[idx] = max(0, req[idx] - mi)
+                    modes[t] = (dur, req)
+
+    def _transitive_reduction(self):
+        """Bỏ cung bắc cầu trong precedence."""
+        n = self.jobs
+        succ = {u: set(self.precedence.get(u, [])) for u in range(1, n + 1)}
+        # Floyd–Warshall kiểu reachability
+        reach = {u: set(succ[u]) for u in range(1, n + 1)}
+        changed = True
+        while changed:
+            changed = False
+            for u in range(1, n + 1):
+                add = set()
+                for v in list(reach[u]):
+                    add |= reach[v]
+                if not add.issubset(reach[u]):
+                    reach[u] |= add
+                    changed = True
+        # bỏ cạnh (u,w) nếu tồn tại v: u->v và v->w
+        for u in range(1, n + 1):
+            to_remove = set()
+            for w in succ[u]:
+                for v in succ[u]:
+                    if v != w and w in reach[v]:
+                        to_remove.add(w);
+                        break
+            if to_remove:
+                succ[u] -= to_remove
+        self.precedence = {u: sorted(list(succ[u])) for u in succ if succ[u]}
+
+    def _compute_time_windows_cpm(self):
+        """ES forward & LF backward theo min duration; LS = LF - min duration."""
+        # topo bằng BFS đơn giản
+        preds = {j: set() for j in range(1, self.jobs + 1)}
+        for u, Vs in self.precedence.items():
+            for v in Vs:
+                preds[v].add(u)
+        from collections import deque
+        q = deque([j for j in range(1, self.jobs + 1) if not preds[j]])
+        order = []
+        succ = {u: set(self.precedence.get(u, [])) for u in range(1, self.jobs + 1)}
+        indeg = {j: len(preds[j]) for j in preds}
+        while q:
+            u = q.popleft();
+            order.append(u)
+            for v in succ[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0: q.append(v)
+
+        min_dur = {j: (min(m[0] for m in self.job_modes[j]) if self.job_modes.get(j) else 0)
+                   for j in range(1, self.jobs + 1)}
+        # ES
+        self.ES = {j: 0 for j in range(1, self.jobs + 1)}
+        for u in order:
+            for v in succ[u]:
+                self.ES[v] = max(self.ES[v], self.ES[u] + min_dur[u])
+        # LF/LS
+        sink = self.jobs
+        H = self.horizon
+        LF = {j: H for j in range(1, self.jobs + 1)}
+        rev = {j: set() for j in range(1, self.jobs + 1)}
+        for u in succ:
+            for v in succ[u]:
+                rev[v].add(u)
+        for u in reversed(order):
+            if not succ[u]:  # nếu là sink hoặc không có kế tiếp
+                LF[u] = min(LF[u], H)
+            else:
+                LF[u] = min(LF[u], min(LF[v] - min_dur[v] for v in succ[u]))
+        self.LS = {j: max(0, LF[j] - min_dur[j]) for j in LF}
+
+    def _preprocess_all(self):
+        self._remove_infeasible_and_dominated_modes()
+        self._eo_reduce_nonrenewables_inplace()
+        self._transitive_reduction()
+        self._compute_time_windows_cpm()
 
     def calculate_time_windows(self):
         """Calculate ES và LS cho từng job"""

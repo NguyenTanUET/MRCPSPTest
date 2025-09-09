@@ -4,15 +4,20 @@ MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
 
 from pysat.pb import PBEnc
 from pysat.formula import CNF, IDPool
-from pysat.solvers import Glucose42
-import time
 import math
+import os, time
+import importlib.util
 
+HAVE_CMS = importlib.util.find_spec("pycryptosat") is not None
+if HAVE_CMS:
+    from pycryptosat import Solver as CMSSolver  # type: ignore
+else:
+    from pysat.solvers import Glucose42  # hoặc Cadical
 
 class MRCPSPBlockBasedStaircase:
     """MRCPSP Encoder với precedence-aware adaptive block width"""
 
-    def __init__(self, mm_reader):
+    def __init__(self, mm_reader, time_limit_s=None):
         self.cnf = CNF()
         self.vpool = IDPool()
 
@@ -28,8 +33,10 @@ class MRCPSPBlockBasedStaircase:
         self.precedence = mm_reader.data['precedence']
         self.job_modes = mm_reader.data['job_modes']
 
-        # Time windows
         self._preprocess_all()
+        # Time windows
+        self.calculate_time_windows()
+
         # Precedence-aware block widths
         self.precedence_widths = {}  # {(pred, succ): width}
         self.calculate_precedence_widths()
@@ -826,19 +833,51 @@ class MRCPSPBlockBasedStaircase:
 
         # Solve
         print("Solving SAT instance...")
-        solver = Glucose42()
-        solver.append_formula(self.cnf)
+
+        self.last_clause_count = len(self.cnf.clauses)
+        self.last_var_count = getattr(self.vpool, 'top', getattr(self.vpool, '_top', 0))
 
         start_time = time.time()
-        result = solver.solve()
-        solve_time = time.time() - start_time
 
-        print(f"Solve time: {solve_time:.2f}s")
+        if HAVE_CMS:
+            # ===== CryptoMiniSat (đa luồng) =====
+            threads = max(1, os.cpu_count() or 1)  # i7-13700K: 24 luồng logic
+            per_check_timeout = 600  # giây / 1 lần check trong search
 
-        if result:
-            return self.extract_solution(solver.get_model())
+            solver = CMSSolver(threads=threads)
+            for cl in self.cnf.clauses:
+                solver.add_clause(cl)
+
+            sat, model = solver.solve(time_limit=per_check_timeout)
+            solve_time = time.time() - start_time
+            print(f"Solve time: {solve_time:.2f}s")
+
+            if sat:
+                # pycryptosat trả model là list bool, đổi sang list[int] để tái dùng extract_solution()
+                ints = []
+                top = self.last_var_count
+                for v in range(1, top + 1):
+                    val = model[v] if v < len(model) else False
+                    if val is None:
+                        continue
+                    ints.append(v if val else -v)
+                return self.extract_solution(ints)
+            else:
+                return None
         else:
-            return None
+            solver = Glucose42()
+            solver.append_formula(self.cnf)
+
+            start_time = time.time()
+            result = solver.solve()
+            solve_time = time.time() - start_time
+
+            print(f"Solve time: {solve_time:.2f}s")
+
+            if result:
+                return self.extract_solution(solver.get_model())
+            else:
+                return None
 
     def extract_solution(self, model):
         """Extract solution from SAT model"""
@@ -873,34 +912,65 @@ class MRCPSPBlockBasedStaircase:
         return solution
 
     def find_optimal_makespan(self):
-        """Find optimal makespan using binary search"""
-        min_makespan = self.calculate_critical_path_bound()
-        max_makespan = self.horizon
+        """Find optimal makespan using LB-anchored binary search (never probes < LB)."""
+        # Lower bound: critical-path (có xét ES của sink) – giữ làm mốc neo
+        initial_lb = self.calculate_critical_path_bound()
+        lb = initial_lb
+        ub = self.horizon
 
-        best_makespan = None
-        best_solution = None
+        best_ms = None
+        best_sol = None
 
-        print(f"\n=== SEARCHING FOR OPTIMAL MAKESPAN ===")
-        print(f"Search range: [{min_makespan}, {max_makespan}]")
+        print(f"\n=== SEARCHING FOR OPTIMAL MAKESPAN (LB-anchored) ===")
+        print(f"Search range: [{lb}, {ub}] (LB is anchored at {initial_lb})")
 
-        while min_makespan <= max_makespan:
-            mid = (min_makespan + max_makespan) // 2
+        # Nếu LB == UB thì thử luôn một phát rồi thoát
+        if lb == ub:
+            sol = self.solve(lb)
+            if sol:
+                return lb, sol
+            return None, None
 
-            solution = self.solve(mid)
+        while lb <= ub:
+            # mid luôn neo theo LB để không bao giờ < LB
+            mid = lb + (ub - lb) // 2
+            if mid < initial_lb:
+                mid = initial_lb
 
-            if solution:
-                best_makespan = mid
-                best_solution = solution
-                max_makespan = mid - 1
+            print(f"\n[BS] lb={lb}, ub={ub}, try mid={mid}")
+
+            sol = self.solve(mid)
+
+            if sol:
+                # SAT: cập nhật nghiệm tốt nhất và hạ ub,
+                # nhưng vẫn đảm bảo không đẩy ub xuống dưới LB
+                best_ms, best_sol = mid, sol
+                if mid == initial_lb:
+                    # Không thể thấp hơn LB nữa ⇒ kết thúc sớm
+                    print(f"Found solution at LB={initial_lb}. Early stop.")
+                    break
+                ub = max(lb, mid - 1)
                 print(f"Found solution with makespan {mid}, searching for better...")
             else:
-                min_makespan = mid + 1
+                # UNSAT: tăng lb
+                lb = max(mid + 1, initial_lb)
                 print(f"No solution with makespan {mid}, increasing bound...")
 
-        return best_makespan, best_solution
+            # Nhanh gọn khi còn phạm vi rất hẹp: thử tuần tự để tránh lặp mid
+            if ub - lb <= 2 and best_ms is None:
+                for m in range(lb, ub + 1):
+                    if m < initial_lb:
+                        continue
+                    s = self.solve(m)
+                    if s:
+                        return m, s
+                return None, None
+
+        return best_ms, best_sol
 
     def calculate_critical_path_bound(self):
         """Calculate critical path lower bound"""
+
         critical_length = {}
 
         def get_critical_length(j):
@@ -1031,7 +1101,7 @@ def run_precedence_aware_encoding(test_file=None):
         return None, None
 
     if test_file is None:
-        test_file = "data/j30/j3010_10.mm"
+        test_file = "data/j30/j3053_6.mm"
 
     print("=" * 100)
     print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
@@ -1052,6 +1122,7 @@ def run_precedence_aware_encoding(test_file=None):
 
     # Create encoder with precedence-aware blocks
     encoder = MRCPSPBlockBasedStaircase(reader)
+    print(f"[INFO] Using {'CryptoMiniSat' if HAVE_CMS else 'Glucose'} with threads={os.cpu_count()}")
 
     # Find optimal makespan
     import time
