@@ -1,5 +1,7 @@
 """
 MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
+Batch runner (CLOUD): quét toàn bộ .mm trong data/j30, giải với timeout 1800s/instance,
+ghi CSV định kỳ 10 dòng/lần vào result/j30/ và upload lên GCS nếu cấu hình.
 """
 
 from pysat.pb import PBEnc
@@ -7,7 +9,16 @@ from pysat.formula import CNF, IDPool
 from pysat.solvers import Glucose42
 import time
 import math
+from pathlib import Path
+import csv
+from datetime import datetime
 
+# ===== NEW: imports cho sandbox subprocess & util =====
+import subprocess, sys, json, os, signal, uuid, traceback
+
+# ==========================
+#  Phần ENCODER
+# ==========================
 
 class MRCPSPBlockBasedStaircase:
     """MRCPSP Encoder với precedence-aware adaptive block width"""
@@ -51,6 +62,8 @@ class MRCPSPBlockBasedStaircase:
             'register_bits': 0,
             'connection_clauses': 0,
         }
+        self.last_var_count = 0
+        self.last_clause_count = 0
 
     def _remove_infeasible_and_dominated_modes(self):
         """1) Bỏ mode không khả thi (vượt capacity)  2) Bỏ mode bị chi phối (dominated)."""
@@ -321,7 +334,7 @@ class MRCPSPBlockBasedStaircase:
         if self.precedence_widths:
             widths = list(self.precedence_widths.values())
             print(f"\nWidth statistics:")
-            print(f"  Average: {sum(widths)/len(widths):.1f}")
+            print(f"  Average: {sum(widths) / len(widths):.1f}")
             print(f"  Min: {min(widths)}, Max: {max(widths)}")
             print(f"  Total precedence pairs: {len(self.precedence_widths)}")
 
@@ -458,18 +471,18 @@ class MRCPSPBlockBasedStaircase:
         self.stats['clauses'] += 1
 
         # 2) For j=2..k-1: (¬x_j ∨ y_j)
-        for j in range(1, k-1):
+        for j in range(1, k - 1):
             self.cnf.append([-x_vars[j], y_vars[j]])
             self.stats['clauses'] += 1
 
         # 3) for j=1..k-2: (¬y_j ∨ y_{j+1})
-        for j in range(0, k-2):
-            self.cnf.append([-y_vars[j], y_vars[j+1]])
+        for j in range(0, k - 2):
+            self.cnf.append([-y_vars[j], y_vars[j + 1]])
             self.stats['clauses'] += 1
 
         # 4) for j=2..k: (¬x_j ∨ ¬y_{j-1})
         for j in range(1, k):
-            self.cnf.append([-x_vars[j], -y_vars[j-1]])
+            self.cnf.append([-x_vars[j], -y_vars[j - 1]])
             self.stats['clauses'] += 1
 
     def encode_amz_block(self, block_id, job, start, end):
@@ -555,7 +568,7 @@ class MRCPSPBlockBasedStaircase:
                               vpool=self.vpool,
                               encoding=1)
             self.cnf.extend(pb)
-    
+
     def add_precedence_constraints_with_blocks(self):
         """Precedence using job-level SCAMO y-vars.
         For (pred->succ), if pred starts at t with mode m (dur=d), forbid succ start times ≤ t+d-1 by
@@ -570,12 +583,12 @@ class MRCPSPBlockBasedStaircase:
                     blocks = self.create_blocks_for_job(succ)
                     for (bid, st, en, _bt, _a, _b) in blocks:
                         self.encode_amo_block(bid, succ, st, en)
-                    for i in range(len(blocks)-1):
-                        self.connect_blocks(blocks[i][0], blocks[i+1][0])
+                    for i in range(len(blocks) - 1):
+                        self.connect_blocks(blocks[i][0], blocks[i + 1][0])
                 blocks = sorted(self.job_blocks[succ], key=lambda b: b[1])
                 for m_pred, mode in enumerate(self.job_modes[pred]):
                     dur = mode[0]
-                    for t_pred in range(self.ES[pred], self.LS[pred]+1):
+                    for t_pred in range(self.ES[pred], self.LS[pred] + 1):
                         if t_pred not in self.s_vars[pred]:
                             continue
                         thr = t_pred + dur - 1
@@ -634,7 +647,7 @@ class MRCPSPBlockBasedStaircase:
                     valid_starts = []
 
                     for t_start in range(max(self.ES[j], t - duration + 1),
-                                       min(self.LS[j] + 1, t + 1)):
+                                         min(self.LS[j] + 1, t + 1)):
                         if t_start in self.s_vars[j] and t_start + duration > t:
                             valid_starts.append(self.s_vars[j][t_start])
 
@@ -677,7 +690,7 @@ class MRCPSPBlockBasedStaircase:
 
                 if resource_vars:
                     pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                                self.R_capacity[k], vpool=self.vpool, encoding=5)
+                                                 self.R_capacity[k], vpool=self.vpool, encoding=5)
                     self.cnf.extend(pb_constraint)
 
     def add_nonrenewable_resource_constraints(self):
@@ -792,6 +805,8 @@ class MRCPSPBlockBasedStaircase:
             self.add_makespan_constraint(makespan)
 
         self.stats['clauses'] = len(self.cnf.clauses)
+        self.last_var_count = self.vpool.top if hasattr(self.vpool, 'top') else getattr(self.vpool, '_top', 0)
+        self.last_clause_count = len(self.cnf.clauses)
 
         print(f"\n=== ENCODING STATISTICS ===")
         print(f"Total variables: {self.vpool.top if hasattr(self.vpool, 'top') else self.vpool._top}")
@@ -930,20 +945,6 @@ class MRCPSPBlockBasedStaircase:
         critical_path = get_critical_length(1)
         return max(critical_path, self.ES[self.jobs] if self.jobs in self.ES else 1)
 
-    def print_solution(self, solution, makespan):
-        """Print solution details"""
-        print(f"\n=== SOLUTION ===")
-        print(f"Makespan: {makespan}")
-        print(f"\n{'Job':<5} {'Mode':<6} {'Start':<7} {'Duration':<10} {'Finish':<8} {'Resources':<20}")
-        print("-" * 65)
-
-        for j in sorted(solution.keys()):
-            info = solution[j]
-            res_str = ' '.join(f"{r:2d}" for r in info['resources'])
-            print(f"{j:<5} {info['mode']+1:<6} {info['start_time']:<7} "
-                  f"{info['duration']:<10} {info['finish_time']:<8} "
-                  f"{res_str:<20}")
-
     def validate_solution(self, solution):
         """Validate the solution"""
         print("\n=== VALIDATING SOLUTION ===")
@@ -985,7 +986,7 @@ class MRCPSPBlockBasedStaircase:
                             usage += info['resources'][k]
 
                 if usage > self.R_capacity[k]:
-                    print(f"  ✗ Renewable resource {k+1} violated at time {t}: "
+                    print(f"  ✗ Renewable resource {k + 1} violated at time {t}: "
                           f"usage={usage} > capacity={self.R_capacity[k]}")
                     valid = False
                     renewable_ok = False
@@ -1005,7 +1006,7 @@ class MRCPSPBlockBasedStaircase:
                     total_usage += info['resources'][resource_idx]
 
             if total_usage > self.N_capacity[k]:
-                print(f"  ✗ Non-renewable resource {k+1} violated: "
+                print(f"  ✗ Non-renewable resource {k + 1} violated: "
                       f"total usage={total_usage} > capacity={self.N_capacity[k]}")
                 valid = False
                 nonrenewable_ok = False
@@ -1020,56 +1021,322 @@ class MRCPSPBlockBasedStaircase:
 
         return valid
 
-
-def run_precedence_aware_encoding(test_file=None):
-    """Test the precedence-aware block encoding"""
-
+# ==========================
+#  Reader .mm
+# ==========================
+def load_reader(mm_path):
+    """Tải MRCPSPDataReader từ file .mm."""
     try:
         from MRCPSP_Basic import MRCPSPDataReader
-    except:
-        print("Cannot import MRCPSPDataReader")
-        return None, None
+    except Exception as e:
+        raise ImportError(f"Không import được MRCPSPDataReader: {e}")
+    return MRCPSPDataReader(str(mm_path))
 
-    if test_file is None:
-        test_file = "data/j30/j3010_10.mm"
+# ==========================
+#  Giải 1 instance (nhị phân + timeout)
+# ==========================
+def _atomic_dump_json(path: Path, payload: dict):
+    tmp = Path(str(path) + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)  # atomic rename
 
-    print("=" * 100)
-    print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
-    print("=" * 100)
+def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | None = None):
+    """
+    Trả về dict:
+      instance, horizon, variables, clauses, makespan, status, Solve time, timeout, error
+    Nếu checkpoint_path != None: ghi checkpoint mỗi khi có nghiệm tốt hơn (best-so-far).
+    """
+    reader = load_reader(mm_path)
+    enc = MRCPSPBlockBasedStaircase(reader)
 
-    reader = MRCPSPDataReader(test_file)
+    lb = enc.calculate_critical_path_bound()
+    ub = reader.get_horizon()
 
-    print(f"\nInstance: {test_file}")
-    print(f"Jobs: {reader.data['num_jobs']}")
-    print(f"Horizon: {reader.get_horizon()}")
-    print(f"Resources: R={reader.data['renewable_capacity']}, N={reader.data['nonrenewable_capacity']}")
+    start = time.time()
+    timeout_flag = False
+    best_makespan = None
+    best_vars = 0
+    best_clauses = 0
 
-    # Show precedence structure
-    print(f"\nPrecedence structure:")
-    for j in range(1, min(reader.data['num_jobs'] + 1, 8)):  # Show first 7 jobs
-        if j in reader.data['precedence'] and reader.data['precedence'][j]:
-            print(f"  Job {j} → {reader.data['precedence'][j]}")
+    lo, hi = lb, ub
+    while lo <= hi:
+        if time.time() - start > timeout_s:
+            timeout_flag = True
+            break
 
-    # Create encoder with precedence-aware blocks
-    encoder = MRCPSPBlockBasedStaircase(reader)
+        mid = (lo + hi) // 2
+        solution = enc.solve(mid)
 
-    # Find optimal makespan
-    import time
-    start_time = time.time()
-    optimal_makespan, solution = encoder.find_optimal_makespan()
-    total_time = time.time() - start_time
+        if time.time() - start > timeout_s:
+            timeout_flag = True
 
-    if optimal_makespan and solution:
-        encoder.print_solution(solution, optimal_makespan)
-        encoder.validate_solution(solution)
-        print(f"\n✓ Successfully found optimal makespan = {optimal_makespan}")
-        print(f"Total solving time: {total_time:.2f}s")
-        return optimal_makespan, total_time
+        if solution:
+            # cập nhật best-so-far
+            best_makespan = mid
+            best_vars = enc.last_var_count
+            best_clauses = enc.last_clause_count
+            hi = mid - 1
+
+            # ghi checkpoint ngay khi có nghiệm mới
+            if checkpoint_path is not None:
+                _atomic_dump_json(checkpoint_path, {
+                    "instance": Path(mm_path).name,
+                    "horizon": ub,
+                    "variables": best_vars,
+                    "clauses": best_clauses,
+                    "makespan": best_makespan,
+                    "status": "Feasible",           # có nghiệm nhưng chưa chắc optimal
+                    "Solve time": f"{time.time()-start:.2f}",
+                    "timeout": "No",
+                    "error": ""
+                })
+        else:
+            lo = mid + 1
+
+        if timeout_flag:
+            break
+
+    total_time = time.time() - start
+    if timeout_flag:
+        status = "Feasible"  # yêu cầu của bạn: timeout => Feasible
     else:
-        print(f"\n✗ No solution found")
-        return None, None
+        status = "Optimal" if best_makespan is not None else "Infeasible"
 
+    row = {
+        "instance": Path(mm_path).name,
+        "horizon": ub,
+        "variables": best_vars if best_makespan is not None else enc.last_var_count,
+        "clauses": best_clauses if best_makespan is not None else enc.last_clause_count,
+        "makespan": best_makespan if best_makespan is not None else "",
+        "status": status,
+        "Solve time": f"{total_time:.2f}",
+        "timeout": "Yes" if timeout_flag else "No",
+        "error": ""
+    }
+    return row
+
+
+# ==========================
+#  WORKER chế độ 1-instance (subprocess)
+# ==========================
+def _worker_main():
+    """
+    Chạy trong chế độ worker: giải đúng 1 instance rồi ghi JSON ra file --out.
+    """
+    import argparse, gc
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--mm", required=True, help="Đường dẫn file .mm")
+    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--out", required=True, help="Đường dẫn file JSON output")
+    args = parser.parse_args()
+
+    mm_path = Path(args.mm)
+    out_path = Path(args.out)
+
+    try:
+        row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+    except Exception as e:
+        tb = traceback.format_exc()
+        row = {"instance": mm_path.name, "horizon": "",
+               "variables": 0, "clauses": 0,
+               "makespan": "", "status": "Error",
+               "Solve time": "0.00", "timeout": "No",
+               "error": f"{e}\n{tb}"}
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(row, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+TMP_DIR = Path("tmp_results")  # chỗ chứa JSON tạm
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
+    out_final = TMP_DIR / f"{mm_path.stem}__{uuid.uuid4().hex}.json"
+    out_part  = TMP_DIR / (out_final.name + ".part")
+
+    cmd = [
+        sys.executable, "-u", __file__,
+        "--worker",
+        "--mm", str(mm_path),
+        "--out", str(out_part),
+        "--timeout", str(time_limit),
+    ]
+
+    wall = time_limit + 1
+    t0 = time.time()
+    # Quan trọng: không PIPE stdout để tránh treo vì đầy buffer
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,          # <- tránh block do log
+        stderr=subprocess.PIPE,             # giữ stderr để chẩn đoán nếu fail
+        text=True,
+        start_new_session=True,             # để kill theo group
+    )
+    try:
+        _, err = proc.communicate(timeout=wall)
+    except subprocess.TimeoutExpired:
+        # quá hạn: kill cả group (solver con, v.v.)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        try:
+            proc.wait(5)
+        except Exception:
+            pass
+
+        # Thử đọc checkpoint nếu có
+        data = None
+        if out_part.exists():
+            for _ in range(10):  # retry ngắn
+                try:
+                    with open(out_part, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    break
+                except json.JSONDecodeError:
+                    time.sleep(0.1)
+
+        if data is not None:
+            data["timeout"] = "Yes"
+            data["status"] = "Feasible"
+            data["Solve time"] = f"{time.time() - t0:.2f}"
+            data["error"] = "wall-time kill (parent)"
+            return data
+
+        # fallback nếu không có checkpoint
+        return {
+            "instance": mm_path.name, "horizon": "",
+            "variables": 0, "clauses": 0,
+            "makespan": "", "status": "Feasible",  # cũng để Feasible khi timeout
+            "Solve time": f"{time.time() - t0:.2f}",
+            "timeout": "Yes",
+            "error": "wall-time kill (parent)"
+        }
+
+    # Worker xong: nếu có file .part thì rename atomically
+    if out_part.exists():
+        try:
+            out_part.replace(out_final)
+        except Exception:
+            pass
+
+    # Đọc JSON với retry ngắn (tránh đọc sớm)
+    data = None
+    for _ in range(25):  # ~2.5s
+        if out_final.exists():
+            try:
+                with open(out_final, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                break
+            except json.JSONDecodeError:
+                time.sleep(0.1)
+        else:
+            time.sleep(0.1)
+
+    if data is None:
+        err_msg = (err or "").strip() if proc.returncode else "no-json"
+        return {
+            "instance": mm_path.name, "horizon": "",
+            "variables": 0, "clauses": 0,
+            "makespan": "", "status": "Error",
+            "Solve time": f"{time.time()-t0:.2f}",
+            "timeout": "No",
+            "error": f"missing worker JSON; rc={proc.returncode}; stderr={err_msg[:500]}"
+        }
+    return data
+
+# ==========================
+#  Chạy hàng loạt & ghi CSV + upload GCS
+# ==========================
+def run_batch_j30(
+    data_dir="data/j30_remainder",
+    out_dir="result/j30_remainder",
+    timeout_s=1800,
+):
+    """
+    Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
+    gs://<gcs_bucket>/<gcs_prefix>/<csv_filename>
+    """
+    data_path = Path(data_dir)
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # chuẩn bị sandbox worker & file CSV
+    script_path = Path(__file__).resolve()
+    tmp_dir = out_path / "_tmp_worker"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_file = out_path / f"MRCPSP_j30_results_{ts}.csv"
+
+    fields = ["instance", "horizon", "variables", "clauses",
+              "makespan", "status", "Solve time", "timeout", "error"]
+
+    results = []
+    mm_files = sorted(data_path.glob("*.mm"))
+    print(f"Found {len(mm_files)} instances in {data_path}")
+
+    # Ghi header ngay khi tạo file
+    with csv_file.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+
+
+    for idx, mm in enumerate(mm_files, start=1):
+        print(f"[{idx}/{len(mm_files)}] Solving {mm.name} ...")
+        try:
+            # CHẠY TRONG SUBPROCESS CÁCH LY RAM/exit(0)
+            row = _run_worker_for_instance(mm, timeout_s)
+        except Exception as e:
+            print(f"  -> Error instance {mm.name}: {e}")
+            row = {
+                "instance": mm.name, "horizon": "", "variables": 0, "clauses": 0,
+                "makespan": "", "status": "Error", "Solve time": "0.00",
+                "timeout": "No", "error": "parent call error"
+            }
+
+        results.append(row)
+
+        # Ghi theo lô mỗi 10 dòng
+        if idx % 2 == 0:
+            with csv_file.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+                writer.writerows(results[-2:])
+            print(f"  ✓ Đã lưu tạm 10 dòng vào {csv_file}")
+
+    # Ghi nốt phần còn lại (<10 cuối)
+    remainder = len(results) % 2
+    if remainder:
+        with csv_file.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+            writer.writerows(results[-remainder:])
+        print(f"  ✓ Đã lưu phần còn lại ({remainder} dòng) vào {csv_file}")
+
+    return csv_file
+
+# ==========================
+#  Entry point
+# ==========================
 if __name__ == "__main__":
-    # Default test
-    run_precedence_aware_encoding()
-    print("\n" + "=" * 100)
+    # Nếu được gọi như worker (chạy 1 instance duy nhất)
+    if "--worker" in sys.argv:
+        _worker_main()
+        sys.exit(0)
+
+    # Chế độ batch (cloud)
+    run_batch_j30(
+        data_dir="data/j30_remainder",
+        out_dir="result/j30_remainder",
+        timeout_s=1800,
+    )

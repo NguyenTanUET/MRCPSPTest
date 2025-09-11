@@ -4,7 +4,6 @@ MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
 
 from pysat.pb import PBEnc
 from pysat.formula import CNF, IDPool
-from pysat.solvers import Glucose42
 import time
 import math
 
@@ -555,6 +554,7 @@ class MRCPSPBlockBasedStaircase:
                               vpool=self.vpool,
                               encoding=1)
             self.cnf.extend(pb)
+
     
     def add_precedence_constraints_with_blocks(self):
         """Precedence using job-level SCAMO y-vars.
@@ -621,7 +621,6 @@ class MRCPSPBlockBasedStaircase:
                                             [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
                                         self.stats['clauses'] += 2
                                 break  # only one containing block
-
     def add_process_variable_constraints(self):
         """Define process variables"""
         for j in range(1, self.jobs + 1):
@@ -803,11 +802,204 @@ class MRCPSPBlockBasedStaircase:
 
         return self.cnf
 
-    def solve(self, makespan):
-        """Solve with given makespan"""
-        print(f"\n--- Solving with makespan = {makespan} ---")
+    def _extract_solution_from_true_set(self, true_set):
+        """Map model literals to (mode, start_time, finish_time) per job."""
+        solution = {}
+        # Build reverse maps once
+        # s_vars[j][t] -> var id; sm_vars[j][m] -> var id
+        for j in range(1, self.jobs + 1):
+            # Start
+            st = None
+            if j in self.s_vars:
+                for t, vid in self.s_vars[j].items():
+                    if vid in true_set:
+                        st = t
+                        break
+            # Mode
+            md = None
+            if j in self.sm_vars:
+                for m, vid in self.sm_vars[j].items():
+                    if vid in true_set:
+                        md = m
+                        break
+            if st is not None and md is not None:
+                dur = int(self.job_modes[j][md][0])
+                solution[j] = {
+                    'mode': int(md),
+                    'start_time': int(st),
+                    'duration': dur,
+                    'finish_time': int(st + dur),
+                    'resources': self.job_modes[j][md][1],
+                }
+        return solution
 
-        # Reset
+
+    def _run_parafrost(self, dimacs_path, parafrost_bin='parafrost', timeout=None, extra_args=None):
+        """
+        Run ParaFROST correctly with <cnf> <options...>, capture SAT/UNSAT + model.
+        Returns: (status: 'SAT'|'UNSAT'|'UNKNOWN', true_set: set[int])
+        """
+        import subprocess, shlex
+
+        def _invoke(args):
+            # Merge stderr into stdout để dễ xem log
+            return subprocess.run(
+                args, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=timeout
+            )
+
+        # ----- 1) Chuẩn hoá options -----
+        opts = list(extra_args or [])
+
+        # Hỗ trợ người dùng truyền "--verbose 2" -> đổi thành "--verbose=2"
+        if "--verbose" in opts:
+            i = opts.index("--verbose")
+            if i + 1 < len(opts) and opts[i + 1].isdigit():
+                val = opts[i + 1]
+                del opts[i + 1]
+                opts[i] = f"--verbose={val}"
+
+        # Thêm --timeout nếu có timeout từ Python mà options chưa có
+        has_timeout = any(o == "--timeout" or o.startswith("--timeout=") for o in opts)
+        if timeout and not has_timeout:
+            # ParaFROST chấp nhận dạng --timeout=value
+            opts.append(f"--timeout={int(timeout)}")
+
+        # ----- 2) QUAN TRỌNG: CNF file phải đặt TRƯỚC options -----
+        # Theo cú pháp ParaFROST: parafrost <cnf> [options...]
+        cmd = [parafrost_bin, dimacs_path] + opts
+        print("[parafrost-cmd]", " ".join(shlex.quote(c) for c in cmd))
+
+        # ----- 3) Chạy -----
+        try:
+            proc = _invoke(cmd)
+            out = proc.stdout or ""
+            up = out.upper()
+            print("[parafrost-rc]", proc.returncode)
+            # In ~2k ký tự đầu để thấy banner + lỗi cú pháp nếu có
+            print("[parafrost-raw]\n", out[:2000])
+        except subprocess.TimeoutExpired:
+            print("[parafrost-timeout] Process timed out after", timeout, "seconds")
+            return "UNKNOWN", set()
+
+        # ----- 4) Bắt trạng thái bằng rc + text -----
+        if proc.returncode == 20 or "UNSATISFIABLE" in up:
+            print("[parafrost-status] UNSAT")
+            return "UNSAT", set()
+
+        status = "SAT" if (proc.returncode == 10 or "SATISFIABLE" in up) else "UNKNOWN"
+
+        # ----- 5) Thu model lines (v ...) -----
+        def _collect_true_set(text):
+            s = set()
+            for line in text.splitlines():
+                ls = line.strip()
+                if ls.lower().startswith("v "):
+                    # DIMACS model: 'v <lit...> 0'
+                    for tok in ls.split()[1:]:
+                        if tok == "0":
+                            break
+                        try:
+                            lit = int(tok)
+                            if lit > 0:
+                                s.add(lit)
+                        except:
+                            pass
+            return s
+
+        true_set = _collect_true_set(out)
+
+        # ----- 6) Nếu biết SAT mà chưa có model -> tự rerun với -model -modelprint -----
+        have_model_flags = any(f in (extra_args or []) for f in ("-model", "-modelprint"))
+        if status == "SAT" and not true_set and not have_model_flags:
+            cmd2 = [parafrost_bin, dimacs_path] + opts + ["-model", "-modelprint"]
+            print("[parafrost-cmd-rerun]", " ".join(shlex.quote(c) for c in cmd2))
+            try:
+                proc2 = _invoke(cmd2)
+                out2 = proc2.stdout or ""
+                up2 = out2.upper()
+                print("[parafrost-rc-rerun]", proc2.returncode)
+                print("[parafrost-raw-rerun]\n", out2[:2000])
+            except subprocess.TimeoutExpired:
+                print("[parafrost-timeout-rerun] Process timed out after", timeout, "seconds")
+                return "UNKNOWN", set()
+
+            if proc2.returncode == 20 or "UNSATISFIABLE" in up2:
+                print("[parafrost-status] UNSAT (after rerun)")
+                return "UNSAT", set()
+
+            status = "SAT" if (proc2.returncode == 10 or "SATISFIABLE" in up2) else status
+            true_set = _collect_true_set(out2)
+
+        print("[parafrost-status-final]", status, "true_vars=", len(true_set))
+        return status, true_set
+
+    def print_solution(self, solution, makespan=None):
+        print("\\n=== SOLUTION ===")
+        if makespan is not None:
+            print(f"Makespan bound: {makespan}")
+        for j in sorted(solution.keys()):
+            s = solution[j]
+            print(
+                f"Job {j:3d}  start={s['start_time']:4d}  dur={s['duration']:3d}  finish={s['finish_time']:4d}  mode={s['mode']}")
+
+    def validate_solution(self, solution):
+        # Exactly one start/mode per job
+        for j in range(1, self.jobs + 1):
+            if j not in solution:
+                raise AssertionError(f"Job {j} missing in solution")
+        # Precedence
+        for u, Vs in self.precedence.items():
+            for v in Vs:
+                if solution[u]['finish_time'] > solution[v]['start_time']:
+                    raise AssertionError(
+                        f"Precedence violated: {u}->{v}  (finish {solution[u]['finish_time']} > start {solution[v]['start_time']})")
+        print("Validation: OK.")
+
+    def find_optimal_makespan(self, parafrost_bin="/home/nguyentan/ParaFROST/build/gpu/bin/parafrost", timeout=None,
+                              extra_args=None):
+        # We'll search on the sink job's start-time upper bound (as encoded in add_makespan_constraint)
+        sink = self.jobs
+        # Lower/upper bounds
+        min_dur = min(m[0] for m in self.job_modes[sink]) if self.job_modes.get(sink) else 0
+        lo = self.ES.get(sink, 0)  # earliest start
+        hi = self.LS.get(sink, self.horizon)  # latest start
+        best_ms = None
+        best_sol = None
+
+        print(f"\n=== BINARY SEARCH FOR OPTIMAL MAKESPAN ===")
+        print(f"Search range: sink start [{lo}, {hi}], sink min_dur={min_dur}")
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            print(f"\n[BS] Trying makespan = {mid} (search bounds: [{lo}, {hi}])")
+
+            try:
+                sol = self.solve(mid, parafrost_bin=parafrost_bin, timeout=timeout, extra_args=extra_args)
+            except Exception as e:
+                print(f"[BS] Error solving makespan {mid}: {e}")
+                sol = None
+
+            if sol:
+                print(f"[BS] ✓ Found solution with makespan {mid}")
+                best_ms, best_sol = mid, sol
+                hi = mid - 1
+            else:
+                print(f"[BS] ✗ No solution with makespan {mid}")
+                lo = mid + 1
+
+        if best_ms is not None:
+            print(f"\n[BS] Optimal makespan found: {best_ms}")
+        else:
+            print(f"\n[BS] No feasible solution found in range")
+
+        return best_ms, best_sol
+
+    def solve(self, makespan, parafrost_bin="/home/nguyentan/ParaFROST/build/gpu/bin/parafrost", timeout=None, extra_args=None):
+        """Solve using ParaFROST (GPU). Glucose path removed by request."""
+        print(f"\n--- Solving with makespan = {makespan} via ParaFROST ---")
+        # Reset and encode
         self.cnf = CNF()
         self.vpool = IDPool()
         self.precedence_blocks = {}
@@ -820,256 +1012,144 @@ class MRCPSPBlockBasedStaircase:
             'register_bits': 0,
             'connection_clauses': 0,
         }
-
-        # Encode
+        start_time_enc = time.time()
         self.encode(makespan)
+        print(f"[encode] variables={len(self.vpool.obj2id)} clauses={len(self.cnf.clauses)} time={time.time()-start_time_enc:.2f}s")
 
-        # Solve
-        print("Solving SAT instance...")
-        solver = Glucose42()
-        solver.append_formula(self.cnf)
+        import os, shlex
+        cnf_path = "/tmp/mrcpsp_diag.cnf"  # file cố định để bạn chạy tay
+        self.cnf.to_file(cnf_path)
+        print(f"[parafrost] CNF saved at: {cnf_path}")
+        # Lệnh đúng để bạn có thể chạy tay y chang:
+        demo_cmd = [parafrost_bin, cnf_path] + (extra_args or []) + (
+            ['--timeout', str(int(timeout))] if timeout and '--timeout' not in ' '.join(extra_args or []) else [])
+        print("[parafrost-demo]", " ".join(shlex.quote(c) for c in demo_cmd))
 
-        start_time = time.time()
-        result = solver.solve()
-        solve_time = time.time() - start_time
+        status, true_set = self._run_parafrost(
+            cnf_path, parafrost_bin=parafrost_bin, timeout=timeout, extra_args=extra_args
+        )
+        print(f"[parafrost] status={status}, true_vars={len(true_set)}")
 
-        print(f"Solve time: {solve_time:.2f}s")
-
-        if result:
-            return self.extract_solution(solver.get_model())
+        # QUAN TRỌNG: Trích xuất solution nếu SAT
+        if status == "SAT" and true_set:
+            try:
+                solution = self._extract_solution_from_true_set(true_set)
+                if solution:  # Kiểm tra solution có hợp lệ không
+                    return solution
+                else:
+                    print("[parafrost] Warning: Found SAT but could not extract valid solution")
+                    return None
+            except Exception as e:
+                print(f"[parafrost] Error extracting solution: {e}")
+                return None
+        elif status == "SAT":
+            print("[parafrost] Warning: SAT but no true variables found")
+            return None
         else:
+            # UNSAT hoặc UNKNOWN
             return None
 
-    def extract_solution(self, model):
-        """Extract solution from SAT model"""
-        solution = {}
-
-        for j in range(1, self.jobs + 1):
-            # Find start time
-            start_time = None
-            for t in range(self.ES[j], self.LS[j] + 1):
-                if t in self.s_vars[j] and self.s_vars[j][t] <= len(model) and model[self.s_vars[j][t] - 1] > 0:
-                    start_time = t
-                    break
-
-            # Find mode
-            mode = None
-            for m in range(len(self.job_modes[j])):
-                if self.sm_vars[j][m] <= len(model) and model[self.sm_vars[j][m] - 1] > 0:
-                    mode = m
-                    break
-
-            if start_time is not None and mode is not None:
-                duration = self.job_modes[j][mode][0]
-                resources = self.job_modes[j][mode][1]
-                solution[j] = {
-                    'mode': mode,
-                    'start_time': start_time,
-                    'duration': duration,
-                    'finish_time': start_time + duration,
-                    'resources': resources
-                }
-
-        return solution
-
-    def find_optimal_makespan(self):
-        """Find optimal makespan using binary search"""
-        min_makespan = self.calculate_critical_path_bound()
-        max_makespan = self.horizon
-
-        best_makespan = None
-        best_solution = None
-
-        print(f"\n=== SEARCHING FOR OPTIMAL MAKESPAN ===")
-        print(f"Search range: [{min_makespan}, {max_makespan}]")
-
-        while min_makespan <= max_makespan:
-            mid = (min_makespan + max_makespan) // 2
-
-            solution = self.solve(mid)
-
-            if solution:
-                best_makespan = mid
-                best_solution = solution
-                max_makespan = mid - 1
-                print(f"Found solution with makespan {mid}, searching for better...")
-            else:
-                min_makespan = mid + 1
-                print(f"No solution with makespan {mid}, increasing bound...")
-
-        return best_makespan, best_solution
-
-    def calculate_critical_path_bound(self):
-        """Calculate critical path lower bound"""
-        critical_length = {}
-
-        def get_critical_length(j):
-            if j in critical_length:
-                return critical_length[j]
-
-            if j not in self.precedence or not self.precedence[j]:
-                if j in self.job_modes and self.job_modes[j]:
-                    critical_length[j] = min(mode[0] for mode in self.job_modes[j])
-                else:
-                    critical_length[j] = 0
-                return critical_length[j]
-
-            max_path = 0
-            for succ in self.precedence[j]:
-                path_length = get_critical_length(succ)
-                max_path = max(max_path, path_length)
-
-            if j in self.job_modes and self.job_modes[j]:
-                min_duration = min(mode[0] for mode in self.job_modes[j])
-            else:
-                min_duration = 0
-
-            critical_length[j] = min_duration + max_path
-            return critical_length[j]
-
-        critical_path = get_critical_length(1)
-        return max(critical_path, self.ES[self.jobs] if self.jobs in self.ES else 1)
-
-    def print_solution(self, solution, makespan):
-        """Print solution details"""
-        print(f"\n=== SOLUTION ===")
-        print(f"Makespan: {makespan}")
-        print(f"\n{'Job':<5} {'Mode':<6} {'Start':<7} {'Duration':<10} {'Finish':<8} {'Resources':<20}")
-        print("-" * 65)
-
-        for j in sorted(solution.keys()):
-            info = solution[j]
-            res_str = ' '.join(f"{r:2d}" for r in info['resources'])
-            print(f"{j:<5} {info['mode']+1:<6} {info['start_time']:<7} "
-                  f"{info['duration']:<10} {info['finish_time']:<8} "
-                  f"{res_str:<20}")
-
-    def validate_solution(self, solution):
-        """Validate the solution"""
-        print("\n=== VALIDATING SOLUTION ===")
-        valid = True
-
-        # Get actual makespan
-        actual_makespan = max(s['finish_time'] for s in solution.values())
-        print(f"Actual makespan from solution: {actual_makespan}")
-
-        # Check precedence constraints
-        print("\nChecking precedence constraints...")
-        precedence_ok = True
-        for pred in range(1, self.jobs + 1):
-            if pred not in self.precedence or pred not in solution:
-                continue
-
-            for succ in self.precedence[pred]:
-                if succ not in solution:
-                    continue
-
-                if solution[pred]['finish_time'] > solution[succ]['start_time']:
-                    print(f"  ✗ Precedence violated: Job {pred} finishes at {solution[pred]['finish_time']}, "
-                          f"but Job {succ} starts at {solution[succ]['start_time']}")
-                    valid = False
-                    precedence_ok = False
-
-        if precedence_ok:
-            print("  ✓ All precedence constraints satisfied")
-
-        # Check renewable resources
-        print("\nChecking renewable resource constraints...")
-        renewable_ok = True
-        for k in range(self.renewable_resources):
-            for t in range(actual_makespan + 1):
-                usage = 0
-                for j, info in solution.items():
-                    if info['start_time'] <= t < info['finish_time']:
-                        if len(info['resources']) > k:
-                            usage += info['resources'][k]
-
-                if usage > self.R_capacity[k]:
-                    print(f"  ✗ Renewable resource {k+1} violated at time {t}: "
-                          f"usage={usage} > capacity={self.R_capacity[k]}")
-                    valid = False
-                    renewable_ok = False
-                    break
-
-        if renewable_ok:
-            print("  ✓ All renewable resource constraints satisfied")
-
-        # Check non-renewable resources
-        print("\nChecking non-renewable resource constraints...")
-        nonrenewable_ok = True
-        for k in range(self.nonrenewable_resources):
-            total_usage = 0
-            for j, info in solution.items():
-                resource_idx = self.renewable_resources + k
-                if len(info['resources']) > resource_idx:
-                    total_usage += info['resources'][resource_idx]
-
-            if total_usage > self.N_capacity[k]:
-                print(f"  ✗ Non-renewable resource {k+1} violated: "
-                      f"total usage={total_usage} > capacity={self.N_capacity[k]}")
-                valid = False
-                nonrenewable_ok = False
-
-        if nonrenewable_ok:
-            print("  ✓ All non-renewable resource constraints satisfied")
-
-        if valid:
-            print("\n✓ Solution is VALID!")
-        else:
-            print("\n✗ Solution is INVALID!")
-
-        return valid
-
-
-def run_precedence_aware_encoding(test_file=None):
-    """Test the precedence-aware block encoding"""
+def run_precedence_aware_encoding(
+    test_file="data/j30/j3037_10.mm",
+    parafrost_bin= "/home/nguyentan/ParaFROST/build/gpu/bin/parafrost",
+    timeout=600,
+    extra_args=None,
+):
+    """Chạy encoder với ParaFROST (GPU), có tìm tối ưu + fallback."""
+    import os, time
+    from shutil import which
 
     try:
         from MRCPSP_Basic import MRCPSPDataReader
-    except:
-        print("Cannot import MRCPSPDataReader")
+    except Exception as e:
+        print(f"[error] Cannot import MRCPSPDataReader: {e}")
         return None, None
 
-    if test_file is None:
-        test_file = "data/j30/j3010_10.mm"
+    # Kiểm tra binary ParaFROST
+    if which(parafrost_bin) is None and not os.path.exists(parafrost_bin):
+        print(f"[error] parafrost not found: {parafrost_bin}")
+        print("  -> Thiết lập đúng đường dẫn --parafrost hoặc thêm vào PATH.")
+        return None, None
 
-    print("=" * 100)
-    print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
-    print("=" * 100)
-
+    # Tải instance
     reader = MRCPSPDataReader(test_file)
-
+    print("=" * 100)
+    print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING (ParaFROST)")
+    print("=" * 100)
     print(f"\nInstance: {test_file}")
     print(f"Jobs: {reader.data['num_jobs']}")
     print(f"Horizon: {reader.get_horizon()}")
     print(f"Resources: R={reader.data['renewable_capacity']}, N={reader.data['nonrenewable_capacity']}")
 
-    # Show precedence structure
-    print(f"\nPrecedence structure:")
-    for j in range(1, min(reader.data['num_jobs'] + 1, 8)):  # Show first 7 jobs
+    # Precedence xem nhanh (tối đa 7 job đầu)
+    print("\nPrecedence structure:")
+    for j in range(1, min(reader.data['num_jobs'] + 1, 8)):
         if j in reader.data['precedence'] and reader.data['precedence'][j]:
             print(f"  Job {j} → {reader.data['precedence'][j]}")
 
-    # Create encoder with precedence-aware blocks
+    # Tạo encoder
     encoder = MRCPSPBlockBasedStaircase(reader)
 
-    # Find optimal makespan
-    import time
-    start_time = time.time()
-    optimal_makespan, solution = encoder.find_optimal_makespan()
-    total_time = time.time() - start_time
+    # Tìm makespan tối ưu (binary search)
+    t0 = time.time()
+    best_ms, best_sol = encoder.find_optimal_makespan(
+        parafrost_bin=parafrost_bin,
+        timeout=timeout,
+        extra_args=extra_args,
+    )
+    elapsed = time.time() - t0
 
-    if optimal_makespan and solution:
-        encoder.print_solution(solution, optimal_makespan)
-        encoder.validate_solution(solution)
-        print(f"\n✓ Successfully found optimal makespan = {optimal_makespan}")
-        print(f"Total solving time: {total_time:.2f}s")
-        return optimal_makespan, total_time
-    else:
-        print(f"\n✗ No solution found")
-        return None, None
+    if best_ms is not None and best_sol:
+        encoder.print_solution(best_sol, best_ms)
+        encoder.validate_solution(best_sol)
+        print(f"\n✓ Found optimal makespan = {best_ms}")
+        print(f"Total solving time: {elapsed:.2f}s")
+        return best_ms, elapsed
+
+    # Fallback: thử 1 bound hợp lý (LS của sink)
+    sink = encoder.jobs
+    ms = encoder.LS.get(sink, encoder.horizon)
+    print(f"\n[info] Fallback: trying single solve at makespan={ms} ...")
+    try:
+        sol = encoder.solve(
+            ms,
+            parafrost_bin=parafrost_bin,
+            timeout=timeout,
+            extra_args=extra_args,
+        )
+    except RuntimeError as e:
+        print(f"[warn] {e}")
+        sol = None
+
+    elapsed2 = time.time() - t0
+    if sol:
+        encoder.print_solution(sol, ms)
+        encoder.validate_solution(sol)
+        print(f"\n✓ Feasible at makespan = {ms}")
+        print(f"Total solving time: {elapsed2:.2f}s")
+        return ms, elapsed2
+
+    print("\n✗ No solution found")
+    return None, None
+
 
 if __name__ == "__main__":
-    # Default test
-    run_precedence_aware_encoding()
-    print("\n" + "=" * 100)
+    import argparse, shlex
+    import os
+
+    print(os.path.exists("/home/nguyentan/ParaFROST/build/gpu/bin/parafrost"))
+    print(os.access("/home/nguyentan/ParaFROST/build/gpu/bin/parafrost", os.X_OK))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--inst", default="data/j30/j3037_10.mm", help="Đường dẫn file .mm")
+    ap.add_argument("--parafrost", default="/home/nguyentan/ParaFROST/build/gpu/bin/parafrost", help="Đường dẫn binary parafrost (hoặc tên nếu đã có trong PATH)")
+    ap.add_argument("--timeout", type=int, default=600, help="Giới hạn thời gian solver (giây)")
+    ap.add_argument("--args", default="", help="Extra args cho ParaFROST (vd: \"-q --no-store\")")
+    a = ap.parse_args()
+    extra = shlex.split(a.args) if a.args else None
+    run_precedence_aware_encoding(
+        test_file="data/j30/j3037_10.mm",
+        parafrost_bin="/home/nguyentan/ParaFROST/build/gpu/bin/parafrost",
+        timeout=600,
+        extra_args=["-model", "-modelprint", "-report", "-profilegpu", "--verbose=2"]
+    )
+

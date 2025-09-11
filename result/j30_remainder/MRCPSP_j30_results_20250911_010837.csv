@@ -1,0 +1,9 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+j3013_10.mm,232,400102,1568166,53,Feasible,9.48,Yes,
+j3037_1.mm,241,418116,1682481,78,Feasible,7.90,Yes,
+j3037_10.mm,235,441791,1678620,48,Feasible,8.15,Yes,
+j3037_2.mm,227,307985,1317162,76,Feasible,7.44,Yes,
+j3037_3.mm,239,390954,1606610,78,Feasible,5.96,Yes,
+j3037_4.mm,236,389987,1578605,81,Feasible,7.68,Yes,
+j3037_7.mm,226,354681,1428756,62,Feasible,36.22,Yes,
+j3037_8.mm,239,390463,1627027,75,Feasible,5.08,Yes,

@@ -1,0 +1,3 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+j3013_10.mm,232,400102,1568166,53,Feasible,48.12,Yes,wall-time kill (parent)
+j3037_1.mm,241,418116,1682481,78,Feasible,48.12,Yes,wall-time kill (parent)
