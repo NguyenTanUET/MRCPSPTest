@@ -143,7 +143,7 @@ class MRCPSPBlockBasedStaircase:
 
     def _compute_time_windows_cpm(self):
         """ES forward & LF backward theo min duration; LS = LF - min duration."""
-        # topo bằng BFS đơn giản
+        # topo bằng BFS
         preds = {j: set() for j in range(1, self.jobs + 1)}
         for u, Vs in self.precedence.items():
             for v in Vs:
@@ -182,49 +182,86 @@ class MRCPSPBlockBasedStaircase:
                 LF[u] = min(LF[u], min(LF[v] - min_dur[v] for v in succ[u]))
         self.LS = {j: max(0, LF[j] - min_dur[j]) for j in LF}
 
+    def _extend_precedence_by_time_windows(self):
+        """
+        Extended precedence set (EPS) từ ES/LS với d_min.
+        Luật:
+          - nếu LS[j] < ES[i] + dmin[i]  ⇒  i -> j
+          - nếu LS[i] < ES[j] + dmin[j]  ⇒  j -> i
+        Chỉ thêm cạnh thuận theo thứ tự topo để tránh tạo vòng.
+        Trả về: số cạnh mới đã thêm.
+        """
+        n = self.jobs
+        # succ là đồ thị hiện tại
+        succ = {u: set(self.precedence.get(u, [])) for u in range(1, n + 1)}
+
+        # topo hiện tại (từ _compute_time_windows_cpm đã có)
+        preds = {j: set() for j in range(1, n + 1)}
+        for u, Vs in succ.items():
+            for v in Vs:
+                preds[v].add(u)
+        from collections import deque
+        q = deque([j for j in range(1, n + 1) if not preds[j]])
+        topo = []
+        indeg = {j: len(preds[j]) for j in preds}
+        while q:
+            u = q.popleft();
+            topo.append(u)
+            for v in succ[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    q.append(v)
+        pos = {node: i for i, node in enumerate(topo)}
+
+        # d_min
+        dmin = {j: (min(m[0] for m in self.job_modes[j]) if self.job_modes.get(j) else 0)
+                for j in range(1, n + 1)}
+
+        added = 0
+        # duyệt tất cả cặp i != j chưa có liên hệ trực tiếp
+        for i in range(1, n + 1):
+            for j in range(1, n + 1):
+                if i == j:
+                    continue
+                if j in succ[i] or i in succ[j]:
+                    continue  # đã có cạnh (i->j) hoặc (j->i)
+
+                # Luật TW ⇒ hướng ưu tiên theo thứ tự topo để tránh vòng
+                must_i_before_j = (self.LS[j] < self.ES[i] + dmin[i])
+                must_j_before_i = (self.LS[i] < self.ES[j] + dmin[j])
+
+                if must_i_before_j and (pos.get(i, -1) < pos.get(j, 10 ** 9)):
+                    succ[i].add(j);
+                    added += 1
+                elif must_j_before_i and (pos.get(j, -1) < pos.get(i, 10 ** 9)):
+                    succ[j].add(i);
+                    added += 1
+
+        if added > 0:
+            # cập nhật và transitive reduction
+            self.precedence = {u: sorted(list(succ[u])) for u in succ if succ[u]}
+            # giảm bắc cầu
+            self._transitive_reduction()
+        return added
+
     def _preprocess_all(self):
+        # 1) lọc mode + EO reduction
         self._remove_infeasible_and_dominated_modes()
         self._eo_reduce_nonrenewables_inplace()
-        self._transitive_reduction()
+
+        # 2) Lặp: reduce -> CPM -> EPS -> (có thêm cạnh?) -> lặp
+        rounds = 0
+        while True:
+            rounds += 1
+            self._transitive_reduction()
+            self._compute_time_windows_cpm()
+            added = self._extend_precedence_by_time_windows()
+            # nếu không thêm nữa hoặc đã lặp 3 vòng thì dừng
+            if added == 0 or rounds >= 3:
+                break
+
+        # 3) Sau cùng tính lại time windows
         self._compute_time_windows_cpm()
-
-    def calculate_time_windows(self):
-        """Calculate ES and LS for each job"""
-        self.ES = {}
-        self.LS = {}
-
-        # Initialize
-        for j in range(1, self.jobs + 1):
-            self.ES[j] = 0
-            self.LS[j] = self.horizon
-
-        # Forward pass for ES
-        processed = set()
-
-        def calc_es(j):
-            if j in processed:
-                return self.ES[j]
-
-            max_pred_finish = 0
-            for pred in range(1, self.jobs + 1):
-                if pred in self.precedence and j in self.precedence[pred]:
-                    pred_es = calc_es(pred)
-                    if pred in self.job_modes and self.job_modes[pred]:
-                        min_duration = min(mode[0] for mode in self.job_modes[pred])
-                        max_pred_finish = max(max_pred_finish, pred_es + min_duration)
-
-            self.ES[j] = max_pred_finish
-            processed.add(j)
-            return self.ES[j]
-
-        for j in range(1, self.jobs + 1):
-            calc_es(j)
-
-        # Backward pass for LS
-        for j in range(1, self.jobs + 1):
-            if j in self.job_modes and self.job_modes[j]:
-                max_duration = max(mode[0] for mode in self.job_modes[j])
-                self.LS[j] = min(self.LS[j], self.horizon - max_duration)
 
     def get_adaptive_width_for_precedence(self, pred_job, succ_job):
         """
@@ -661,6 +698,7 @@ class MRCPSPBlockBasedStaircase:
 
     def add_renewable_resource_constraints(self):
         """Renewable resource constraints"""
+        clause_before = len(self.cnf.clauses)
         for k in range(self.renewable_resources):
             for t in range(self.horizon + 1):
                 resource_vars = []
@@ -680,6 +718,11 @@ class MRCPSPBlockBasedStaircase:
                                                 self.R_capacity[k], vpool=self.vpool, encoding=5)
                     self.cnf.extend(pb_constraint)
 
+        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
+        renewable_clauses = clauses_after - clause_before
+        print(f"Số clauses sinh ra từ add_renewable_resource_constraints: {renewable_clauses}")
+
+
     def add_nonrenewable_resource_constraints(self):
         """
         Non-renewable with EO-reduction (4.4.1/3.2.5) + fallback:
@@ -688,6 +731,7 @@ class MRCPSPBlockBasedStaircase:
           - sum delta_{iok} * sm_{io} <= B'_k, where delta = max(0, b_{iok} - m_i)
           - if B'_k < 0  -> fallback to plain PB: sum b_{iok} * sm_{io} <= B_k
         """
+        clause_before = len(self.cnf.clauses)
         for k in range(self.nonrenewable_resources):
             idx = self.renewable_resources + k  # cột non-renewable k trong vector yêu cầu
 
@@ -733,7 +777,7 @@ class MRCPSPBlockBasedStaircase:
                 return resource_vars, resource_weights
 
             if Bk_reduced < 0:
-                # Fallback an toàn: dùng PB gốc để tránh UNSAT giả
+                # basic PB
                 resource_vars, resource_weights = _plain_pb_lists()
                 if resource_vars:
                     pb = PBEnc.atmost(lits=resource_vars,
@@ -743,7 +787,7 @@ class MRCPSPBlockBasedStaircase:
                                       encoding=5)
                     self.cnf.extend(pb)
             else:
-                # EO-reduction chuẩn
+                # EO-reduction
                 resource_vars, resource_weights = _eo_pb_lists()
                 if resource_vars:
                     pb = PBEnc.atmost(lits=resource_vars,
@@ -752,6 +796,11 @@ class MRCPSPBlockBasedStaircase:
                                       vpool=self.vpool,
                                       encoding=5)
                     self.cnf.extend(pb)
+
+        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
+        renewable_clauses = clauses_after - clause_before
+        print(f"Số clauses sinh ra từ add_non_renewable_resource_constraints: {renewable_clauses}")
+
 
     def add_makespan_constraint(self, makespan):
         """Makespan constraint"""
@@ -1031,7 +1080,7 @@ def run_precedence_aware_encoding(test_file=None):
         return None, None
 
     if test_file is None:
-        test_file = "data/j30/j3010_10.mm"
+        test_file = "data/j30/j3022_5.mm"
 
     print("=" * 100)
     print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
