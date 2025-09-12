@@ -921,7 +921,7 @@ class MRCPSPBlockBasedStaircase:
 
         return solution
 
-    def find_optimal_makespan(self):
+    def find_optimal_makespan   (self):
         """Find optimal makespan using binary search"""
         min_makespan = self.calculate_critical_path_bound()
         max_makespan = self.horizon

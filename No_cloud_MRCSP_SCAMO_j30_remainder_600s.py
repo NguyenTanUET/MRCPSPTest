@@ -1,6 +1,6 @@
 """
 MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
-Batch runner (CLOUD): quét toàn bộ .mm trong data/j30, giải với timeout 1800s/instance,
+Batch runner (CLOUD): quét toàn bộ .mm trong data/j30, giải với timeout 3600s/instance,
 ghi CSV định kỳ 10 dòng/lần vào result/j30/ và upload lên GCS nếu cấu hình.
 """
 
@@ -1131,7 +1131,7 @@ def _worker_main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--mm", required=True, help="Đường dẫn file .mm")
-    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--out", required=True, help="Đường dẫn file JSON output")
     args = parser.parse_args()
 
@@ -1262,7 +1262,7 @@ def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
 def run_batch_j30(
     data_dir="data/j30_remainder",
     out_dir="result/j30_remainder",
-    timeout_s=1800,
+    timeout_s=3600,
 ):
     """
     Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
@@ -1309,14 +1309,14 @@ def run_batch_j30(
         results.append(row)
 
         # Ghi theo lô mỗi 10 dòng
-        if idx % 2 == 0:
+        if idx % 1== 0:
             with csv_file.open("a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
                 writer.writerows(results[-2:])
             print(f"  ✓ Đã lưu tạm 10 dòng vào {csv_file}")
 
     # Ghi nốt phần còn lại (<10 cuối)
-    remainder = len(results) % 2
+    remainder = len(results) % 1
     if remainder:
         with csv_file.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
@@ -1338,5 +1338,5 @@ if __name__ == "__main__":
     run_batch_j30(
         data_dir="data/j30_remainder",
         out_dir="result/j30_remainder",
-        timeout_s=1800,
+        timeout_s=3600,
     )

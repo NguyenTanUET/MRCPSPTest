@@ -1,0 +1,21 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+j3013_10.mm,232,400102,1568177,42,Optimal,1156.55,No,
+j3037_1.mm,241,418116,1682502,57,Feasible,1801.17,Yes,wall-time kill (parent)
+j3037_10.mm,235,441791,1678626,42,Optimal,948.41,No,
+j3037_2.mm,227,307985,1317175,63,Feasible,1801.16,Yes,wall-time kill (parent)
+j3037_3.mm,239,390954,1606631,57,Feasible,1813.05,Yes,wall-time kill (parent)
+j3037_4.mm,236,389987,1578632,54,Optimal,791.79,No,
+j3037_7.mm,226,354681,1428761,57,Optimal,1341.16,No,
+j3037_8.mm,239,390463,1627058,44,Optimal,679.01,No,
+j3037_9.mm,250,432836,1755911,83,Feasible,1839.31,Yes,wall-time kill (parent)
+j3045_1.mm,238,421767,1698947,40,Optimal,978.00,No,
+j3045_10.mm,240,426360,1722479,49,Feasible,1843.93,Yes,wall-time kill (parent)
+j3045_2.mm,228,303330,1301334,48,Optimal,725.76,No,
+j3045_3.mm,234,350181,1484536,44,Feasible,1850.17,Yes,wall-time kill (parent)
+j3045_4.mm,231,371134,1487369,57,Feasible,1852.53,Yes,wall-time kill (parent)
+j3045_6.mm,246,406448,1666223,54,Feasible,1852.17,Yes,wall-time kill (parent)
+j3045_8.mm,245,404028,1669323,51,Feasible,1858.79,Yes,wall-time kill (parent)
+j3045_9.mm,235,430982,1672017,42,Optimal,1277.27,No,
+j3053_5.mm,245,416886,1656682,49,Optimal,804.62,No,
+j3053_7.mm,247,399852,1671244,37,Optimal,1215.15,No,
+j3053_8.mm,234,413536,1618679,38,Optimal,657.66,No,
