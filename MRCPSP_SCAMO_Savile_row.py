@@ -1,24 +1,14 @@
 """
 MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
-Batch runner (CLOUD): quét toàn bộ .mm trong data/j30, giải với timeout 3600s/instance,
-ghi CSV định kỳ 10 dòng/lần vào result/j30/ và upload lên GCS nếu cấu hình.
 """
 
 from pysat.pb import PBEnc
 from pysat.formula import CNF, IDPool
 from pysat.solvers import Glucose42
+from savilerow.sr_bridge import write_param, run_savilerow, parse_sr_varmap
 import time
 import math
-from pathlib import Path
-import csv
-from datetime import datetime
 
-# ===== NEW: imports cho sandbox subprocess & util =====
-import subprocess, sys, json, os, signal, uuid, traceback
-
-# ==========================
-#  Phần ENCODER
-# ==========================
 
 class MRCPSPBlockBasedStaircase:
     """MRCPSP Encoder với precedence-aware adaptive block width"""
@@ -62,8 +52,6 @@ class MRCPSPBlockBasedStaircase:
             'register_bits': 0,
             'connection_clauses': 0,
         }
-        self.last_var_count = 0
-        self.last_clause_count = 0
 
     def _remove_infeasible_and_dominated_modes(self):
         """1) Bỏ mode không khả thi (vượt capacity)  2) Bỏ mode bị chi phối (dominated)."""
@@ -106,7 +94,7 @@ class MRCPSPBlockBasedStaircase:
         self.job_modes = new_modes
 
     def _eo_reduce_nonrenewables_inplace(self):
-        """EO-reduction: trừ m_i vào dữ liệu + giảm B_k."""
+        """EO-reduction như trong tài liệu: trừ m_i vào dữ liệu + giảm B_k."""
         R = self.renewable_resources
         for k in range(self.nonrenewable_resources):
             idx = R + k
@@ -156,7 +144,7 @@ class MRCPSPBlockBasedStaircase:
 
     def _compute_time_windows_cpm(self):
         """ES forward & LF backward theo min duration; LS = LF - min duration."""
-        # topo bằng BFS đơn giản
+        # topo bằng BFS
         preds = {j: set() for j in range(1, self.jobs + 1)}
         for u, Vs in self.precedence.items():
             for v in Vs:
@@ -195,49 +183,86 @@ class MRCPSPBlockBasedStaircase:
                 LF[u] = min(LF[u], min(LF[v] - min_dur[v] for v in succ[u]))
         self.LS = {j: max(0, LF[j] - min_dur[j]) for j in LF}
 
+    def _extend_precedence_by_time_windows(self):
+        """
+        Extended precedence set (EPS) từ ES/LS với d_min.
+        Luật:
+          - nếu LS[j] < ES[i] + dmin[i]  ⇒  i -> j
+          - nếu LS[i] < ES[j] + dmin[j]  ⇒  j -> i
+        Chỉ thêm cạnh thuận theo thứ tự topo để tránh tạo vòng.
+        Trả về: số cạnh mới đã thêm.
+        """
+        n = self.jobs
+        # succ là đồ thị hiện tại
+        succ = {u: set(self.precedence.get(u, [])) for u in range(1, n + 1)}
+
+        # topo hiện tại (từ _compute_time_windows_cpm đã có)
+        preds = {j: set() for j in range(1, n + 1)}
+        for u, Vs in succ.items():
+            for v in Vs:
+                preds[v].add(u)
+        from collections import deque
+        q = deque([j for j in range(1, n + 1) if not preds[j]])
+        topo = []
+        indeg = {j: len(preds[j]) for j in preds}
+        while q:
+            u = q.popleft();
+            topo.append(u)
+            for v in succ[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    q.append(v)
+        pos = {node: i for i, node in enumerate(topo)}
+
+        # d_min
+        dmin = {j: (min(m[0] for m in self.job_modes[j]) if self.job_modes.get(j) else 0)
+                for j in range(1, n + 1)}
+
+        added = 0
+        # duyệt tất cả cặp i != j chưa có liên hệ trực tiếp
+        for i in range(1, n + 1):
+            for j in range(1, n + 1):
+                if i == j:
+                    continue
+                if j in succ[i] or i in succ[j]:
+                    continue  # đã có cạnh (i->j) hoặc (j->i)
+
+                # Luật TW ⇒ hướng ưu tiên theo thứ tự topo để tránh vòng
+                must_i_before_j = (self.LS[j] < self.ES[i] + dmin[i])
+                must_j_before_i = (self.LS[i] < self.ES[j] + dmin[j])
+
+                if must_i_before_j and (pos.get(i, -1) < pos.get(j, 10 ** 9)):
+                    succ[i].add(j);
+                    added += 1
+                elif must_j_before_i and (pos.get(j, -1) < pos.get(i, 10 ** 9)):
+                    succ[j].add(i);
+                    added += 1
+
+        if added > 0:
+            # cập nhật và transitive reduction
+            self.precedence = {u: sorted(list(succ[u])) for u in succ if succ[u]}
+            # giảm bắc cầu
+            self._transitive_reduction()
+        return added
+
     def _preprocess_all(self):
+        # 1) lọc mode + EO reduction
         self._remove_infeasible_and_dominated_modes()
         self._eo_reduce_nonrenewables_inplace()
-        self._transitive_reduction()
+
+        # 2) Lặp: reduce -> CPM -> EPS -> (có thêm cạnh?) -> lặp
+        rounds = 0
+        while True:
+            rounds += 1
+            self._transitive_reduction()
+            self._compute_time_windows_cpm()
+            added = self._extend_precedence_by_time_windows()
+            # nếu không thêm nữa hoặc đã lặp 3 vòng thì dừng
+            if added == 0 or rounds >= 3:
+                break
+
+        # 3) Sau cùng tính lại time windows
         self._compute_time_windows_cpm()
-
-    def calculate_time_windows(self):
-        """Calculate ES and LS for each job"""
-        self.ES = {}
-        self.LS = {}
-
-        # Initialize
-        for j in range(1, self.jobs + 1):
-            self.ES[j] = 0
-            self.LS[j] = self.horizon
-
-        # Forward pass for ES
-        processed = set()
-
-        def calc_es(j):
-            if j in processed:
-                return self.ES[j]
-
-            max_pred_finish = 0
-            for pred in range(1, self.jobs + 1):
-                if pred in self.precedence and j in self.precedence[pred]:
-                    pred_es = calc_es(pred)
-                    if pred in self.job_modes and self.job_modes[pred]:
-                        min_duration = min(mode[0] for mode in self.job_modes[pred])
-                        max_pred_finish = max(max_pred_finish, pred_es + min_duration)
-
-            self.ES[j] = max_pred_finish
-            processed.add(j)
-            return self.ES[j]
-
-        for j in range(1, self.jobs + 1):
-            calc_es(j)
-
-        # Backward pass for LS
-        for j in range(1, self.jobs + 1):
-            if j in self.job_modes and self.job_modes[j]:
-                max_duration = max(mode[0] for mode in self.job_modes[j])
-                self.LS[j] = min(self.LS[j], self.horizon - max_duration)
 
     def get_adaptive_width_for_precedence(self, pred_job, succ_job):
         """
@@ -334,7 +359,7 @@ class MRCPSPBlockBasedStaircase:
         if self.precedence_widths:
             widths = list(self.precedence_widths.values())
             print(f"\nWidth statistics:")
-            print(f"  Average: {sum(widths) / len(widths):.1f}")
+            print(f"  Average: {sum(widths)/len(widths):.1f}")
             print(f"  Min: {min(widths)}, Max: {max(widths)}")
             print(f"  Total precedence pairs: {len(self.precedence_widths)}")
 
@@ -471,18 +496,18 @@ class MRCPSPBlockBasedStaircase:
         self.stats['clauses'] += 1
 
         # 2) For j=2..k-1: (¬x_j ∨ y_j)
-        for j in range(1, k - 1):
+        for j in range(1, k-1):
             self.cnf.append([-x_vars[j], y_vars[j]])
             self.stats['clauses'] += 1
 
         # 3) for j=1..k-2: (¬y_j ∨ y_{j+1})
-        for j in range(0, k - 2):
-            self.cnf.append([-y_vars[j], y_vars[j + 1]])
+        for j in range(0, k-2):
+            self.cnf.append([-y_vars[j], y_vars[j+1]])
             self.stats['clauses'] += 1
 
         # 4) for j=2..k: (¬x_j ∨ ¬y_{j-1})
         for j in range(1, k):
-            self.cnf.append([-x_vars[j], -y_vars[j - 1]])
+            self.cnf.append([-x_vars[j], -y_vars[j-1]])
             self.stats['clauses'] += 1
 
     def encode_amz_block(self, block_id, job, start, end):
@@ -568,7 +593,7 @@ class MRCPSPBlockBasedStaircase:
                               vpool=self.vpool,
                               encoding=1)
             self.cnf.extend(pb)
-
+    
     def add_precedence_constraints_with_blocks(self):
         """Precedence using job-level SCAMO y-vars.
         For (pred->succ), if pred starts at t with mode m (dur=d), forbid succ start times ≤ t+d-1 by
@@ -583,12 +608,12 @@ class MRCPSPBlockBasedStaircase:
                     blocks = self.create_blocks_for_job(succ)
                     for (bid, st, en, _bt, _a, _b) in blocks:
                         self.encode_amo_block(bid, succ, st, en)
-                    for i in range(len(blocks) - 1):
-                        self.connect_blocks(blocks[i][0], blocks[i + 1][0])
+                    for i in range(len(blocks)-1):
+                        self.connect_blocks(blocks[i][0], blocks[i+1][0])
                 blocks = sorted(self.job_blocks[succ], key=lambda b: b[1])
                 for m_pred, mode in enumerate(self.job_modes[pred]):
                     dur = mode[0]
-                    for t_pred in range(self.ES[pred], self.LS[pred] + 1):
+                    for t_pred in range(self.ES[pred], self.LS[pred]+1):
                         if t_pred not in self.s_vars[pred]:
                             continue
                         thr = t_pred + dur - 1
@@ -647,7 +672,7 @@ class MRCPSPBlockBasedStaircase:
                     valid_starts = []
 
                     for t_start in range(max(self.ES[j], t - duration + 1),
-                                         min(self.LS[j] + 1, t + 1)):
+                                       min(self.LS[j] + 1, t + 1)):
                         if t_start in self.s_vars[j] and t_start + duration > t:
                             valid_starts.append(self.s_vars[j][t_start])
 
@@ -674,6 +699,7 @@ class MRCPSPBlockBasedStaircase:
 
     def add_renewable_resource_constraints(self):
         """Renewable resource constraints"""
+        clause_before = len(self.cnf.clauses)
         for k in range(self.renewable_resources):
             for t in range(self.horizon + 1):
                 resource_vars = []
@@ -690,8 +716,13 @@ class MRCPSPBlockBasedStaircase:
 
                 if resource_vars:
                     pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                                 self.R_capacity[k], vpool=self.vpool, encoding=5)
+                                                self.R_capacity[k], vpool=self.vpool, encoding=5)
                     self.cnf.extend(pb_constraint)
+
+        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
+        renewable_clauses = clauses_after - clause_before
+        print(f"Số clauses sinh ra từ add_renewable_resource_constraints: {renewable_clauses}")
+
 
     def add_nonrenewable_resource_constraints(self):
         """
@@ -701,6 +732,7 @@ class MRCPSPBlockBasedStaircase:
           - sum delta_{iok} * sm_{io} <= B'_k, where delta = max(0, b_{iok} - m_i)
           - if B'_k < 0  -> fallback to plain PB: sum b_{iok} * sm_{io} <= B_k
         """
+        clause_before = len(self.cnf.clauses)
         for k in range(self.nonrenewable_resources):
             idx = self.renewable_resources + k  # cột non-renewable k trong vector yêu cầu
 
@@ -746,7 +778,7 @@ class MRCPSPBlockBasedStaircase:
                 return resource_vars, resource_weights
 
             if Bk_reduced < 0:
-                # Fallback an toàn: dùng PB gốc để tránh UNSAT giả
+                # basic PB
                 resource_vars, resource_weights = _plain_pb_lists()
                 if resource_vars:
                     pb = PBEnc.atmost(lits=resource_vars,
@@ -756,7 +788,7 @@ class MRCPSPBlockBasedStaircase:
                                       encoding=5)
                     self.cnf.extend(pb)
             else:
-                # EO-reduction chuẩn
+                # EO-reduction
                 resource_vars, resource_weights = _eo_pb_lists()
                 if resource_vars:
                     pb = PBEnc.atmost(lits=resource_vars,
@@ -765,6 +797,11 @@ class MRCPSPBlockBasedStaircase:
                                       vpool=self.vpool,
                                       encoding=5)
                     self.cnf.extend(pb)
+
+        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
+        renewable_clauses = clauses_after - clause_before
+        print(f"Số clauses sinh ra từ add_non_renewable_resource_constraints: {renewable_clauses}")
+
 
     def add_makespan_constraint(self, makespan):
         """Makespan constraint"""
@@ -775,48 +812,155 @@ class MRCPSPBlockBasedStaircase:
                 self.cnf.append([-self.s_vars[sink_job][t]])
                 self.stats['clauses'] += 1
 
-    def encode(self, makespan=None):
-        """Encode with precedence-aware blocks"""
-        print("\n=== ENCODING WITH PRECEDENCE-AWARE BLOCKS ===")
+    def _ensure_validU_mask_ready(self):
+        """
+        Đảm bảo self.u_vars có đủ key hợp lệ để write_param() tạo validU.
+        Quy tắc: ô U[j,t,m] hợp lệ iff (t - dur + 1 <= LS[j]) và (t >= ES[j]).
+        Điều này tương thích với create_variables() của bạn và an toàn cho dur = 0.
+        """
+        if hasattr(self, "u_vars") and self.u_vars:
+            return  # đã có
 
-        print("Creating variables...")
-        self.create_variables()
+        if not hasattr(self, "ES") or not hasattr(self, "LS"):
+            self._compute_time_windows_cpm()
 
-        print("Adding start time constraints...")
-        self.add_start_time_constraints()
+        # Khung t = 0..horizon
+        self.u_vars = {j: {t: {} for t in range(self.horizon + 1)} for j in range(1, self.jobs + 1)}
+        for j in range(1, self.jobs + 1):
+            es, ls = self.ES[j], self.LS[j]
+            Mj = len(self.job_modes[j])
+            for m in range(Mj):
+                dur = int(self.job_modes[j][m][0])
+                for t in range(0, self.horizon + 1):
+                    if (t - dur + 1) <= ls and t >= es:
+                        self.u_vars[j][t][m] = None
 
-        print("Adding mode selection constraints...")
-        self.add_mode_selection_constraints()
+    def _create_start_vars_only(self):
+        """Cấp phát chỉ biến start-time s_{j,t} (giữ nguyên sm/u do Savile Row cung cấp)."""
+        self.s_vars = {j: {} for j in range(1, self.jobs + 1)}
+        for j in range(1, self.jobs + 1):
+            for t in range(self.ES[j], self.LS[j] + 1):
+                self.s_vars[j][t] = self.vpool.id(f's_{j}_{t}')
+                self.stats['variables'] += 1
 
-        print("Adding precedence constraints with adaptive blocks...")
-        self.add_precedence_constraints_with_blocks()
+    def encode(self, makespan=None, use_sr_pb_eo=True,
+               sr_model="savilerow/model_pb_eo.eprime",
+               sr_param="savilerow/instance.param",
+               sr_dimacs="savilerow_out/sr_pb_eo.dimacs",
+               sr_aux="savilerow_out/sr_pb_eo.aux"):
+        """
+        Nếu use_sr_pb_eo=True:
+          - Savile Row sẽ encode:
+              + EO cho mode (SM)
+              + PB-AtMost cho renewable (qua U[j,t,m]) và non-renewable (qua SM[j,m])
+          - Python giữ: SCAMO start-times, precedence (y-register), process link U↔(S,SM), makespan.
+        """
 
-        print("Adding process variable constraints...")
-        self.add_process_variable_constraints()
+        # (1) chuẩn bị các cấu trúc tối thiểu mà write_param cần:
+        #  - ES/LS, horizon, job_modes, R/N capacities…
+        #  - enc.u_vars hoặc ít nhất validU grid để mask U hợp lệ
+        # Nếu hiện bạn chỉ tạo u_vars trong add_process_variable_constraints(),
+        # hãy tạo "validU" trước ở đây (dựa trên ES/LS và duration từng mode):
 
-        print("Adding renewable resource constraints...")
-        self.add_renewable_resource_constraints()
+        if use_sr_pb_eo:
 
-        print("Adding non-renewable resource constraints...")
-        self.add_nonrenewable_resource_constraints()
+            self._ensure_validU_mask_ready()
 
-        if makespan is not None:
-            print(f"Adding makespan constraint: {makespan}")
-            self.add_makespan_constraint(makespan)
+            # (2) ghi instance.param
+            write_param(self, sr_param)
 
-        self.stats['clauses'] = len(self.cnf.clauses)
-        self.last_var_count = self.vpool.top if hasattr(self.vpool, 'top') else getattr(self.vpool, '_top', 0)
-        self.last_clause_count = len(self.cnf.clauses)
+            # (3) gọi Savile Row sinh CNF + varmap
+            run_savilerow(
+                sr_model, sr_param, sr_dimacs, sr_aux,
+                jar_path="/home/nguyentan/savilerow-1.10.1-linux/savilerow.jar",
+                extra_flags=["-sat-amo-ladder"]  # hoặc để trống
+            )
+            # (4) nạp CNF nền của Savile Row
+            base = CNF(from_file=sr_dimacs)
+            self.cnf = base
 
-        print(f"\n=== ENCODING STATISTICS ===")
-        print(f"Total variables: {self.vpool.top if hasattr(self.vpool, 'top') else self.vpool._top}")
-        print(f"  - Basic vars: {self.stats['variables']}")
-        print(f"  - Register bits: {self.stats['register_bits']}")
-        print(f"Total clauses: {self.stats['clauses']}")
-        print(f"Connection clauses: {self.stats['connection_clauses']}")
-        print(f"Precedence pairs encoded: {len(self.precedence_widths)}")
+            # (5) parse varmap -> map SM & U về id DIMACS
+            sm_map, u_map = parse_sr_varmap(sr_aux)
 
-        return self.cnf
+            # (6) cài đặt self.sm_vars & self.u_vars từ map (Essence là 1-based)
+            self.sm_vars = {j: {} for j in range(1, self.jobs + 1)}
+            for j in range(1, self.jobs + 1):
+                Mj = len(self.job_modes[j])
+                for m in range(Mj):
+                    self.sm_vars[j][m] = sm_map[(j, m + 1)]  # m+1 vì 1-based
+
+            # đảm bảo u_vars tồn tại (sẽ được link với S & SM ở bước sau)
+            if not hasattr(self, "u_vars") or not self.u_vars:
+                self.u_vars = {j: {t: {} for t in range(self.horizon + 1)} for j in range(1, self.jobs + 1)}
+
+            for j in range(1, self.jobs + 1):
+                Mj = len(self.job_modes[j])
+                for t in range(self.horizon + 1):
+                    for m in range(Mj):
+                        key = (j, t, m + 1)
+                        if key in u_map:
+                            self.u_vars[j][t][m] = u_map[key]
+
+            # (7) đặt vpool để các biến mới (S, y-register, …) sinh ra sau max var id hiện có
+            if not hasattr(self, "vpool") or self.vpool is None:
+                self.vpool = IDPool()
+
+            self.vpool._top = self.cnf.nv
+            self._create_start_vars_only()
+            self.add_start_time_constraints()
+            self.add_precedence_constraints_with_blocks()
+            self.add_process_variable_constraints()
+
+            if makespan is not None:
+                self.add_makespan_constraint(makespan)
+
+            # cập nhật thống kê
+            self.stats['clauses'] = len(self.cnf.clauses)
+            self.last_var_count = getattr(self.vpool, "top", getattr(self.vpool, "_top", 0))
+            self.last_clause_count = len(self.cnf.clauses)
+            return self.cnf
+
+        else:
+
+            """Encode with precedence-aware blocks"""
+            print("\n=== ENCODING WITH PRECEDENCE-AWARE BLOCKS ===")
+
+            print("Creating variables...")
+            self.create_variables()
+
+            print("Adding start time constraints...")
+            self.add_start_time_constraints()
+
+            print("Adding mode selection constraints...")
+            self.add_mode_selection_constraints()
+
+            print("Adding precedence constraints with adaptive blocks...")
+            self.add_precedence_constraints_with_blocks()
+
+            print("Adding process variable constraints...")
+            self.add_process_variable_constraints()
+
+            print("Adding renewable resource constraints...")
+            self.add_renewable_resource_constraints()
+
+            print("Adding non-renewable resource constraints...")
+            self.add_nonrenewable_resource_constraints()
+
+            if makespan is not None:
+                print(f"Adding makespan constraint: {makespan}")
+                self.add_makespan_constraint(makespan)
+
+            self.stats['clauses'] = len(self.cnf.clauses)
+
+            print(f"\n=== ENCODING STATISTICS ===")
+            print(f"Total variables: {self.vpool.top if hasattr(self.vpool, 'top') else self.vpool._top}")
+            print(f"  - Basic vars: {self.stats['variables']}")
+            print(f"  - Register bits: {self.stats['register_bits']}")
+            print(f"Total clauses: {self.stats['clauses']}")
+            print(f"Connection clauses: {self.stats['connection_clauses']}")
+            print(f"Precedence pairs encoded: {len(self.precedence_widths)}")
+
+            return self.cnf
 
     def solve(self, makespan):
         """Solve with given makespan"""
@@ -887,7 +1031,7 @@ class MRCPSPBlockBasedStaircase:
 
         return solution
 
-    def find_optimal_makespan(self):
+    def find_optimal_makespan   (self):
         """Find optimal makespan using binary search"""
         min_makespan = self.calculate_critical_path_bound()
         max_makespan = self.horizon
@@ -945,6 +1089,20 @@ class MRCPSPBlockBasedStaircase:
         critical_path = get_critical_length(1)
         return max(critical_path, self.ES[self.jobs] if self.jobs in self.ES else 1)
 
+    def print_solution(self, solution, makespan):
+        """Print solution details"""
+        print(f"\n=== SOLUTION ===")
+        print(f"Makespan: {makespan}")
+        print(f"\n{'Job':<5} {'Mode':<6} {'Start':<7} {'Duration':<10} {'Finish':<8} {'Resources':<20}")
+        print("-" * 65)
+
+        for j in sorted(solution.keys()):
+            info = solution[j]
+            res_str = ' '.join(f"{r:2d}" for r in info['resources'])
+            print(f"{j:<5} {info['mode']+1:<6} {info['start_time']:<7} "
+                  f"{info['duration']:<10} {info['finish_time']:<8} "
+                  f"{res_str:<20}")
+
     def validate_solution(self, solution):
         """Validate the solution"""
         print("\n=== VALIDATING SOLUTION ===")
@@ -986,7 +1144,7 @@ class MRCPSPBlockBasedStaircase:
                             usage += info['resources'][k]
 
                 if usage > self.R_capacity[k]:
-                    print(f"  ✗ Renewable resource {k + 1} violated at time {t}: "
+                    print(f"  ✗ Renewable resource {k+1} violated at time {t}: "
                           f"usage={usage} > capacity={self.R_capacity[k]}")
                     valid = False
                     renewable_ok = False
@@ -1006,7 +1164,7 @@ class MRCPSPBlockBasedStaircase:
                     total_usage += info['resources'][resource_idx]
 
             if total_usage > self.N_capacity[k]:
-                print(f"  ✗ Non-renewable resource {k + 1} violated: "
+                print(f"  ✗ Non-renewable resource {k+1} violated: "
                       f"total usage={total_usage} > capacity={self.N_capacity[k]}")
                 valid = False
                 nonrenewable_ok = False
@@ -1021,322 +1179,56 @@ class MRCPSPBlockBasedStaircase:
 
         return valid
 
-# ==========================
-#  Reader .mm
-# ==========================
-def load_reader(mm_path):
-    """Tải MRCPSPDataReader từ file .mm."""
+
+def run_precedence_aware_encoding(test_file=None):
+    """Test the precedence-aware block encoding"""
+
     try:
         from MRCPSP_Basic import MRCPSPDataReader
-    except Exception as e:
-        raise ImportError(f"Không import được MRCPSPDataReader: {e}")
-    return MRCPSPDataReader(str(mm_path))
+    except:
+        print("Cannot import MRCPSPDataReader")
+        return None, None
 
-# ==========================
-#  Giải 1 instance (nhị phân + timeout)
-# ==========================
-def _atomic_dump_json(path: Path, payload: dict):
-    tmp = Path(str(path) + ".tmp")
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)  # atomic rename
+    if test_file is None:
+        test_file = "data/j30/j3010_10.mm"
 
-def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | None = None):
-    """
-    Trả về dict:
-      instance, horizon, variables, clauses, makespan, status, Solve time, timeout, error
-    Nếu checkpoint_path != None: ghi checkpoint mỗi khi có nghiệm tốt hơn (best-so-far).
-    """
-    reader = load_reader(mm_path)
-    enc = MRCPSPBlockBasedStaircase(reader)
+    print("=" * 100)
+    print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
+    print("=" * 100)
 
-    lb = enc.calculate_critical_path_bound()
-    ub = reader.get_horizon()
+    reader = MRCPSPDataReader(test_file)
 
-    start = time.time()
-    timeout_flag = False
-    best_makespan = None
-    best_vars = 0
-    best_clauses = 0
+    print(f"\nInstance: {test_file}")
+    print(f"Jobs: {reader.data['num_jobs']}")
+    print(f"Horizon: {reader.get_horizon()}")
+    print(f"Resources: R={reader.data['renewable_capacity']}, N={reader.data['nonrenewable_capacity']}")
 
-    lo, hi = lb, ub
-    while lo <= hi:
-        if time.time() - start > timeout_s:
-            timeout_flag = True
-            break
+    # Show precedence structure
+    print(f"\nPrecedence structure:")
+    for j in range(1, min(reader.data['num_jobs'] + 1, 8)):  # Show first 7 jobs
+        if j in reader.data['precedence'] and reader.data['precedence'][j]:
+            print(f"  Job {j} → {reader.data['precedence'][j]}")
 
-        mid = (lo + hi) // 2
-        solution = enc.solve(mid)
+    # Create encoder with precedence-aware blocks
+    encoder = MRCPSPBlockBasedStaircase(reader)
 
-        if time.time() - start > timeout_s:
-            timeout_flag = True
+    # Find optimal makespan
+    import time
+    start_time = time.time()
+    optimal_makespan, solution = encoder.find_optimal_makespan()
+    total_time = time.time() - start_time
 
-        if solution:
-            # cập nhật best-so-far
-            best_makespan = mid
-            best_vars = enc.last_var_count
-            best_clauses = enc.last_clause_count
-            hi = mid - 1
-
-            # ghi checkpoint ngay khi có nghiệm mới
-            if checkpoint_path is not None:
-                _atomic_dump_json(checkpoint_path, {
-                    "instance": Path(mm_path).name,
-                    "horizon": ub,
-                    "variables": best_vars,
-                    "clauses": best_clauses,
-                    "makespan": best_makespan,
-                    "status": "Feasible",           # có nghiệm nhưng chưa chắc optimal
-                    "Solve time": f"{time.time()-start:.2f}",
-                    "timeout": "No",
-                    "error": ""
-                })
-        else:
-            lo = mid + 1
-
-        if timeout_flag:
-            break
-
-    total_time = time.time() - start
-    if timeout_flag:
-        status = "Feasible"  # yêu cầu của bạn: timeout => Feasible
+    if optimal_makespan and solution:
+        encoder.print_solution(solution, optimal_makespan)
+        encoder.validate_solution(solution)
+        print(f"\n✓ Successfully found optimal makespan = {optimal_makespan}")
+        print(f"Total solving time: {total_time:.2f}s")
+        return optimal_makespan, total_time
     else:
-        status = "Optimal" if best_makespan is not None else "Infeasible"
+        print(f"\n✗ No solution found")
+        return None, None
 
-    row = {
-        "instance": Path(mm_path).name,
-        "horizon": ub,
-        "variables": best_vars if best_makespan is not None else enc.last_var_count,
-        "clauses": best_clauses if best_makespan is not None else enc.last_clause_count,
-        "makespan": best_makespan if best_makespan is not None else "",
-        "status": status,
-        "Solve time": f"{total_time:.2f}",
-        "timeout": "Yes" if timeout_flag else "No",
-        "error": ""
-    }
-    return row
-
-
-# ==========================
-#  WORKER chế độ 1-instance (subprocess)
-# ==========================
-def _worker_main():
-    """
-    Chạy trong chế độ worker: giải đúng 1 instance rồi ghi JSON ra file --out.
-    """
-    import argparse, gc
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", action="store_true")
-    parser.add_argument("--mm", required=True, help="Đường dẫn file .mm")
-    parser.add_argument("--timeout", type=int, default=3600)
-    parser.add_argument("--out", required=True, help="Đường dẫn file JSON output")
-    args = parser.parse_args()
-
-    mm_path = Path(args.mm)
-    out_path = Path(args.out)
-
-    try:
-        row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
-    except Exception as e:
-        tb = traceback.format_exc()
-        row = {"instance": mm_path.name, "horizon": "",
-               "variables": 0, "clauses": 0,
-               "makespan": "", "status": "Error",
-               "Solve time": "0.00", "timeout": "No",
-               "error": f"{e}\n{tb}"}
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(row, f, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-TMP_DIR = Path("tmp_results")  # chỗ chứa JSON tạm
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
-    out_final = TMP_DIR / f"{mm_path.stem}__{uuid.uuid4().hex}.json"
-    out_part  = TMP_DIR / (out_final.name + ".part")
-
-    cmd = [
-        sys.executable, "-u", __file__,
-        "--worker",
-        "--mm", str(mm_path),
-        "--out", str(out_part),
-        "--timeout", str(time_limit),
-    ]
-
-    wall = time_limit + 1
-    t0 = time.time()
-    # Quan trọng: không PIPE stdout để tránh treo vì đầy buffer
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,          # <- tránh block do log
-        stderr=subprocess.PIPE,             # giữ stderr để chẩn đoán nếu fail
-        text=True,
-        start_new_session=True,             # để kill theo group
-    )
-    try:
-        _, err = proc.communicate(timeout=wall)
-    except subprocess.TimeoutExpired:
-        # quá hạn: kill cả group (solver con, v.v.)
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            proc.kill()
-        try:
-            proc.wait(5)
-        except Exception:
-            pass
-
-        # Thử đọc checkpoint nếu có
-        data = None
-        if out_part.exists():
-            for _ in range(10):  # retry ngắn
-                try:
-                    with open(out_part, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    break
-                except json.JSONDecodeError:
-                    time.sleep(0.1)
-
-        if data is not None:
-            data["timeout"] = "Yes"
-            data["status"] = "Feasible"
-            data["Solve time"] = f"{time.time() - t0:.2f}"
-            data["error"] = "wall-time kill (parent)"
-            return data
-
-        # fallback nếu không có checkpoint
-        return {
-            "instance": mm_path.name, "horizon": "",
-            "variables": 0, "clauses": 0,
-            "makespan": "", "status": "Feasible",  # cũng để Feasible khi timeout
-            "Solve time": f"{time.time() - t0:.2f}",
-            "timeout": "Yes",
-            "error": "wall-time kill (parent)"
-        }
-
-    # Worker xong: nếu có file .part thì rename atomically
-    if out_part.exists():
-        try:
-            out_part.replace(out_final)
-        except Exception:
-            pass
-
-    # Đọc JSON với retry ngắn (tránh đọc sớm)
-    data = None
-    for _ in range(25):  # ~2.5s
-        if out_final.exists():
-            try:
-                with open(out_final, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                break
-            except json.JSONDecodeError:
-                time.sleep(0.1)
-        else:
-            time.sleep(0.1)
-
-    if data is None:
-        err_msg = (err or "").strip() if proc.returncode else "no-json"
-        return {
-            "instance": mm_path.name, "horizon": "",
-            "variables": 0, "clauses": 0,
-            "makespan": "", "status": "Error",
-            "Solve time": f"{time.time()-t0:.2f}",
-            "timeout": "No",
-            "error": f"missing worker JSON; rc={proc.returncode}; stderr={err_msg[:500]}"
-        }
-    return data
-
-# ==========================
-#  Chạy hàng loạt & ghi CSV + upload GCS
-# ==========================
-def run_batch_j30(
-    data_dir="data/j30_remainder",
-    out_dir="result/j30_remainder",
-    timeout_s=3600,
-):
-    """
-    Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
-    gs://<gcs_bucket>/<gcs_prefix>/<csv_filename>
-    """
-    data_path = Path(data_dir)
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    # chuẩn bị sandbox worker & file CSV
-    script_path = Path(__file__).resolve()
-    tmp_dir = out_path / "_tmp_worker"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_file = out_path / f"MRCPSP_j30_results_{ts}.csv"
-
-    fields = ["instance", "horizon", "variables", "clauses",
-              "makespan", "status", "Solve time", "timeout", "error"]
-
-    results = []
-    mm_files = sorted(data_path.glob("*.mm"))
-    print(f"Found {len(mm_files)} instances in {data_path}")
-
-    # Ghi header ngay khi tạo file
-    with csv_file.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-        writer.writeheader()
-
-
-    for idx, mm in enumerate(mm_files, start=1):
-        print(f"[{idx}/{len(mm_files)}] Solving {mm.name} ...")
-        try:
-            # CHẠY TRONG SUBPROCESS CÁCH LY RAM/exit(0)
-            row = _run_worker_for_instance(mm, timeout_s)
-        except Exception as e:
-            print(f"  -> Error instance {mm.name}: {e}")
-            row = {
-                "instance": mm.name, "horizon": "", "variables": 0, "clauses": 0,
-                "makespan": "", "status": "Error", "Solve time": "0.00",
-                "timeout": "No", "error": "parent call error"
-            }
-
-        results.append(row)
-
-        # Ghi theo lô mỗi 10 dòng
-        if idx % 1== 0:
-            with csv_file.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-                writer.writerows(results[-2:])
-            print(f"  ✓ Đã lưu tạm 10 dòng vào {csv_file}")
-
-    # Ghi nốt phần còn lại (<10 cuối)
-    remainder = len(results) % 1
-    if remainder:
-        with csv_file.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-            writer.writerows(results[-remainder:])
-        print(f"  ✓ Đã lưu phần còn lại ({remainder} dòng) vào {csv_file}")
-
-    return csv_file
-
-# ==========================
-#  Entry point
-# ==========================
 if __name__ == "__main__":
-    # Nếu được gọi như worker (chạy 1 instance duy nhất)
-    if "--worker" in sys.argv:
-        _worker_main()
-        sys.exit(0)
-
-    # Chế độ batch (cloud)
-    run_batch_j30(
-        data_dir="data/j30_remainder",
-        out_dir="result/j30_remainder",
-        timeout_s=3600,
-    )
+    # Default test
+    run_precedence_aware_encoding()
+    print("\n" + "=" * 100)

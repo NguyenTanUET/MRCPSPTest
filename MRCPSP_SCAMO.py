@@ -1080,7 +1080,7 @@ def run_precedence_aware_encoding(test_file=None):
         return None, None
 
     if test_file is None:
-        test_file = "data/j30/j3022_5.mm"
+        test_file = "data/j30/j3010_10.mm"
 
     print("=" * 100)
     print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
