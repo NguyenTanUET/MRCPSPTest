@@ -209,8 +209,7 @@ class MRCPSPBlockBasedStaircase:
         self.job_modes = mm_reader.data['job_modes']
 
         # Time windows
-        self.calculate_time_windows()
-
+        self._preprocess_all()
         # Precedence-aware block widths
         self.precedence_widths = {}  # {(pred, succ): width}
         self.calculate_precedence_widths()
@@ -233,43 +232,216 @@ class MRCPSPBlockBasedStaircase:
             'connection_clauses': 0,
         }
 
-    def calculate_time_windows(self):
-        """Calculate ES and LS for each job"""
-        self.ES = {}
-        self.LS = {}
+    def _remove_infeasible_and_dominated_modes(self):
+        """1) Bỏ mode không khả thi (vượt capacity)  2) Bỏ mode bị chi phối (dominated)."""
+        R = self.renewable_resources
+        new_modes = {}
+        for j, modes in self.job_modes.items():
+            # 1) lọc mode không khả thi
+            feas = []
+            for (dur, req) in modes:
+                ok = True
+                # renewables
+                for r in range(R):
+                    if r < len(req) and req[r] > self.R_capacity[r]:
+                        ok = False;
+                        break
+                # non-renewables
+                if ok:
+                    for k in range(self.nonrenewable_resources):
+                        idx = R + k
+                        if idx < len(req) and req[idx] > self.N_capacity[k]:
+                            ok = False;
+                            break
+                if ok:
+                    feas.append((int(dur), list(map(int, req))))
+            # 2) loại dominated
+            keep = []
+            for a, (da, ra) in enumerate(feas):
+                dominated = False
+                for b, (db, rb) in enumerate(feas):
+                    if a == b: continue
+                    leq_all = (db <= da) and all(rb[i] <= ra[i] for i in range(len(ra)))
+                    strict = (db < da) or any(rb[i] < ra[i] for i in range(len(ra)))
+                    if leq_all and strict:
+                        dominated = True;
+                        break
+                if not dominated:
+                    keep.append((da, ra))
+            # không để rỗng
+            new_modes[j] = keep if keep else feas
+        self.job_modes = new_modes
 
-        # Initialize
-        for j in range(1, self.jobs + 1):
-            self.ES[j] = 0
-            self.LS[j] = self.horizon
+    def _eo_reduce_nonrenewables_inplace(self):
+        """EO-reduction như trong tài liệu: trừ m_i vào dữ liệu + giảm B_k."""
+        R = self.renewable_resources
+        for k in range(self.nonrenewable_resources):
+            idx = R + k
+            mins = {}
+            for j, modes in self.job_modes.items():
+                vals = [(m[1][idx] if idx < len(m[1]) else 0) for m in modes]
+                mins[j] = min(vals) if vals else 0
+            red = sum(mins.values())
+            # giảm capacity
+            self.N_capacity[k] = max(0, self.N_capacity[k] - red)
+            # trừ m_i trên từng mode
+            for j, modes in self.job_modes.items():
+                mi = mins[j]
+                for t in range(len(modes)):
+                    dur, req = modes[t]
+                    if idx < len(req):
+                        req[idx] = max(0, req[idx] - mi)
+                    modes[t] = (dur, req)
 
-        # Forward pass for ES
-        processed = set()
+    def _transitive_reduction(self):
+        """Bỏ cung bắc cầu trong precedence."""
+        n = self.jobs
+        succ = {u: set(self.precedence.get(u, [])) for u in range(1, n + 1)}
+        # Floyd–Warshall kiểu reachability
+        reach = {u: set(succ[u]) for u in range(1, n + 1)}
+        changed = True
+        while changed:
+            changed = False
+            for u in range(1, n + 1):
+                add = set()
+                for v in list(reach[u]):
+                    add |= reach[v]
+                if not add.issubset(reach[u]):
+                    reach[u] |= add
+                    changed = True
+        # bỏ cạnh (u,w) nếu tồn tại v: u->v và v->w
+        for u in range(1, n + 1):
+            to_remove = set()
+            for w in succ[u]:
+                for v in succ[u]:
+                    if v != w and w in reach[v]:
+                        to_remove.add(w);
+                        break
+            if to_remove:
+                succ[u] -= to_remove
+        self.precedence = {u: sorted(list(succ[u])) for u in succ if succ[u]}
 
-        def calc_es(j):
-            if j in processed:
-                return self.ES[j]
+    def _compute_time_windows_cpm(self):
+        """ES forward & LF backward theo min duration; LS = LF - min duration."""
+        # topo bằng BFS
+        preds = {j: set() for j in range(1, self.jobs + 1)}
+        for u, Vs in self.precedence.items():
+            for v in Vs:
+                preds[v].add(u)
+        from collections import deque
+        q = deque([j for j in range(1, self.jobs + 1) if not preds[j]])
+        order = []
+        succ = {u: set(self.precedence.get(u, [])) for u in range(1, self.jobs + 1)}
+        indeg = {j: len(preds[j]) for j in preds}
+        while q:
+            u = q.popleft();
+            order.append(u)
+            for v in succ[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0: q.append(v)
 
-            max_pred_finish = 0
-            for pred in range(1, self.jobs + 1):
-                if pred in self.precedence and j in self.precedence[pred]:
-                    pred_es = calc_es(pred)
-                    if pred in self.job_modes and self.job_modes[pred]:
-                        min_duration = min(mode[0] for mode in self.job_modes[pred])
-                        max_pred_finish = max(max_pred_finish, pred_es + min_duration)
+        min_dur = {j: (min(m[0] for m in self.job_modes[j]) if self.job_modes.get(j) else 0)
+                   for j in range(1, self.jobs + 1)}
+        # ES
+        self.ES = {j: 0 for j in range(1, self.jobs + 1)}
+        for u in order:
+            for v in succ[u]:
+                self.ES[v] = max(self.ES[v], self.ES[u] + min_dur[u])
+        # LF/LS
+        sink = self.jobs
+        H = self.horizon
+        LF = {j: H for j in range(1, self.jobs + 1)}
+        rev = {j: set() for j in range(1, self.jobs + 1)}
+        for u in succ:
+            for v in succ[u]:
+                rev[v].add(u)
+        for u in reversed(order):
+            if not succ[u]:  # nếu là sink hoặc không có kế tiếp
+                LF[u] = min(LF[u], H)
+            else:
+                LF[u] = min(LF[u], min(LF[v] - min_dur[v] for v in succ[u]))
+        self.LS = {j: max(0, LF[j] - min_dur[j]) for j in LF}
 
-            self.ES[j] = max_pred_finish
-            processed.add(j)
-            return self.ES[j]
+    def _extend_precedence_by_time_windows(self):
+        """
+        Extended precedence set (EPS) từ ES/LS với d_min.
+        Luật:
+          - nếu LS[j] < ES[i] + dmin[i]  ⇒  i -> j
+          - nếu LS[i] < ES[j] + dmin[j]  ⇒  j -> i
+        Chỉ thêm cạnh thuận theo thứ tự topo để tránh tạo vòng.
+        Trả về: số cạnh mới đã thêm.
+        """
+        n = self.jobs
+        # succ là đồ thị hiện tại
+        succ = {u: set(self.precedence.get(u, [])) for u in range(1, n + 1)}
 
-        for j in range(1, self.jobs + 1):
-            calc_es(j)
+        # topo hiện tại (từ _compute_time_windows_cpm đã có)
+        preds = {j: set() for j in range(1, n + 1)}
+        for u, Vs in succ.items():
+            for v in Vs:
+                preds[v].add(u)
+        from collections import deque
+        q = deque([j for j in range(1, n + 1) if not preds[j]])
+        topo = []
+        indeg = {j: len(preds[j]) for j in preds}
+        while q:
+            u = q.popleft();
+            topo.append(u)
+            for v in succ[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    q.append(v)
+        pos = {node: i for i, node in enumerate(topo)}
 
-        # Backward pass for LS
-        for j in range(1, self.jobs + 1):
-            if j in self.job_modes and self.job_modes[j]:
-                max_duration = max(mode[0] for mode in self.job_modes[j])
-                self.LS[j] = min(self.LS[j], self.horizon - max_duration)
+        # d_min
+        dmin = {j: (min(m[0] for m in self.job_modes[j]) if self.job_modes.get(j) else 0)
+                for j in range(1, n + 1)}
+
+        added = 0
+        # duyệt tất cả cặp i != j chưa có liên hệ trực tiếp
+        for i in range(1, n + 1):
+            for j in range(1, n + 1):
+                if i == j:
+                    continue
+                if j in succ[i] or i in succ[j]:
+                    continue  # đã có cạnh (i->j) hoặc (j->i)
+
+                # Luật TW ⇒ hướng ưu tiên theo thứ tự topo để tránh vòng
+                must_i_before_j = (self.LS[j] < self.ES[i] + dmin[i])
+                must_j_before_i = (self.LS[i] < self.ES[j] + dmin[j])
+
+                if must_i_before_j and (pos.get(i, -1) < pos.get(j, 10 ** 9)):
+                    succ[i].add(j);
+                    added += 1
+                elif must_j_before_i and (pos.get(j, -1) < pos.get(i, 10 ** 9)):
+                    succ[j].add(i);
+                    added += 1
+
+        if added > 0:
+            # cập nhật và transitive reduction
+            self.precedence = {u: sorted(list(succ[u])) for u in succ if succ[u]}
+            # giảm bắc cầu
+            self._transitive_reduction()
+        return added
+
+    def _preprocess_all(self):
+        # 1) lọc mode + EO reduction
+        self._remove_infeasible_and_dominated_modes()
+        self._eo_reduce_nonrenewables_inplace()
+
+        # 2) Lặp: reduce -> CPM -> EPS -> (có thêm cạnh?) -> lặp
+        rounds = 0
+        while True:
+            rounds += 1
+            self._transitive_reduction()
+            self._compute_time_windows_cpm()
+            added = self._extend_precedence_by_time_windows()
+            # nếu không thêm nữa hoặc đã lặp 3 vòng thì dừng
+            if added == 0 or rounds >= 3:
+                break
+
+        # 3) Sau cùng tính lại time windows
+        self._compute_time_windows_cpm()
 
     def get_adaptive_width_for_precedence(self, pred_job, succ_job):
         """
@@ -375,6 +547,8 @@ class MRCPSPBlockBasedStaircase:
         Create blocks for successor based on precedence relationship
         Each precedence pair gets its own block structure
         """
+
+        current_variable = self.va
         width = self.precedence_widths.get((pred_job, succ_job), 10)
 
         # Determine the relevant window for this precedence
@@ -588,25 +762,27 @@ class MRCPSPBlockBasedStaircase:
                 self.connect_blocks(blocks[i][0], blocks[i + 1][0])
 
     def add_mode_selection_constraints(self):
-        """Exactly one mode for each job"""
         for j in range(1, self.jobs + 1):
             mode_vars = [self.sm_vars[j][m] for m in range(len(self.job_modes[j]))]
-
-            # At least one mode
-            self.cnf.append(mode_vars)
-            self.stats['clauses'] += 1
-
-            # At most one mode
-            for i in range(len(mode_vars)):
-                for k in range(i + 1, len(mode_vars)):
-                    self.cnf.append([-mode_vars[i], -mode_vars[k]])
-                    self.stats['clauses'] += 1
+            if len(mode_vars) <= 1:
+                # 0 hoặc 1 mode thì không cần encode thêm
+                continue
+            # Exactly-One: sum(mode_vars) == 1
+            pb = PBEnc.equals(lits=mode_vars,
+                              weights=[1] * len(mode_vars),
+                              bound=1,
+                              vpool=self.vpool,
+                              encoding=1)
+            self.cnf.extend(pb)
 
     def add_precedence_constraints_with_blocks(self):
         """Precedence using job-level SCAMO y-vars.
         For (pred->succ), if pred starts at t with mode m (dur=d), forbid succ start times ≤ t+d-1 by
         setting certain prefix y-vars (or first x) to 0 via conditional clauses.
         """
+        current_variable = self.stats["variables"]
+        current_clauses = self.stats["clauses"]
+
         for pred in range(1, self.jobs + 1):
             if pred not in self.precedence:
                 continue
@@ -668,6 +844,12 @@ class MRCPSPBlockBasedStaircase:
                                         self.stats['clauses'] += 2
                                 break  # only one containing block
 
+        staircase_variable = self.stats["variables"] - current_variable
+        staircase_clauses =  self.stats["clauses"] - current_clauses
+
+        print(f"Number of STAIRCASE variables: {staircase_variable}")
+        print(f"Number of STAIRCASE clauses: {staircase_clauses}")
+
     def add_process_variable_constraints(self):
         """Define process variables"""
         for j in range(1, self.jobs + 1):
@@ -707,6 +889,7 @@ class MRCPSPBlockBasedStaircase:
 
     def add_renewable_resource_constraints(self):
         """Renewable resource constraints"""
+        clause_before = len(self.cnf.clauses)
         for k in range(self.renewable_resources):
             for t in range(self.horizon + 1):
                 resource_vars = []
@@ -723,28 +906,90 @@ class MRCPSPBlockBasedStaircase:
 
                 if resource_vars:
                     pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                                 self.R_capacity[k], vpool=self.vpool)
+                                                 self.R_capacity[k], vpool=self.vpool, encoding=5)
                     self.cnf.extend(pb_constraint)
 
+        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
+        renewable_clauses = clauses_after - clause_before
+        print(f"Số clauses sinh ra từ add_renewable_resource_constraints: {renewable_clauses}")
+
     def add_nonrenewable_resource_constraints(self):
-        """Non-renewable resource constraints"""
+        """
+        Non-renewable with EO-reduction (4.4.1/3.2.5) + fallback:
+          - m_i = min_o b_{iok}
+          - B'_k = B_k - sum_i m_i
+          - sum delta_{iok} * sm_{io} <= B'_k, where delta = max(0, b_{iok} - m_i)
+          - if B'_k < 0  -> fallback to plain PB: sum b_{iok} * sm_{io} <= B_k
+        """
+        clause_before = len(self.cnf.clauses)
         for k in range(self.nonrenewable_resources):
-            resource_vars = []
-            resource_weights = []
+            idx = self.renewable_resources + k  # cột non-renewable k trong vector yêu cầu
 
+            # Tính m_i = min_o b_{iok} (mặc định 0 nếu job không có mode)
+            mins_per_job = {}
             for j in range(1, self.jobs + 1):
+                vals = []
                 for m in range(len(self.job_modes[j])):
-                    resource_idx = self.renewable_resources + k
-                    if len(self.job_modes[j][m][1]) > resource_idx:
-                        resource_req = self.job_modes[j][m][1][resource_idx]
-                        if resource_req > 0:
-                            resource_vars.append(self.sm_vars[j][m])
-                            resource_weights.append(resource_req)
+                    vec = self.job_modes[j][m][1]
+                    v = vec[idx] if len(vec) > idx else 0
+                    vals.append(0 if v is None else int(v))
+                mins_per_job[j] = min(vals) if vals else 0
 
-            if resource_vars:
-                pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                             self.N_capacity[k], vpool=self.vpool)
-                self.cnf.extend(pb_constraint)
+            sum_min = sum(mins_per_job.values())
+            Bk = self.N_capacity[k]
+            Bk_reduced = Bk - sum_min
+
+            # Xây lists biến & trọng số theo 2 phương án
+            def _plain_pb_lists():
+                resource_vars, resource_weights = [], []
+                for j in range(1, self.jobs + 1):
+                    for m in range(len(self.job_modes[j])):
+                        vec = self.job_modes[j][m][1]
+                        v = vec[idx] if len(vec) > idx else 0
+                        v = 0 if v is None else int(v)
+                        if v > 0:
+                            resource_vars.append(self.sm_vars[j][m])
+                            resource_weights.append(v)
+                return resource_vars, resource_weights
+
+            def _eo_pb_lists():
+                resource_vars, resource_weights = [], []
+                for j in range(1, self.jobs + 1):
+                    m_i = mins_per_job[j]
+                    for m in range(len(self.job_modes[j])):
+                        vec = self.job_modes[j][m][1]
+                        v = vec[idx] if len(vec) > idx else 0
+                        v = 0 if v is None else int(v)
+                        delta = v - m_i
+                        if delta > 0:
+                            resource_vars.append(self.sm_vars[j][m])
+                            resource_weights.append(delta)
+                return resource_vars, resource_weights
+
+            if Bk_reduced < 0:
+                # basic PB
+                resource_vars, resource_weights = _plain_pb_lists()
+                if resource_vars:
+                    pb = PBEnc.atmost(lits=resource_vars,
+                                      weights=resource_weights,
+                                      bound=Bk,
+                                      vpool=self.vpool,
+                                      encoding=5)
+                    self.cnf.extend(pb)
+            else:
+                # EO-reduction
+                resource_vars, resource_weights = _eo_pb_lists()
+                if resource_vars:
+                    pb = PBEnc.atmost(lits=resource_vars,
+                                      weights=resource_weights,
+                                      bound=Bk_reduced,
+                                      vpool=self.vpool,
+                                      encoding=5)
+                    self.cnf.extend(pb)
+
+        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
+        renewable_clauses = clauses_after - clause_before
+        print(f"Số clauses sinh ra từ add_non_renewable_resource_constraints: {renewable_clauses}")
 
     def add_makespan_constraint(self, makespan):
         """Makespan constraint"""
@@ -1014,7 +1259,7 @@ class MRCPSPBlockBasedStaircase:
         return valid
 
 if __name__ == "__main__":
-    DEFAULT_INSTANCE = "data/MMLIB50/J5025_4.mm"
+    DEFAULT_INSTANCE = "data/MMLIB50/J50100_1.mm"
     run_one_mmlib50(DEFAULT_INSTANCE, timeout_s=600)
 
 

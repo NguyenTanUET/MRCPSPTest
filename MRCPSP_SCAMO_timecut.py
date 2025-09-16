@@ -362,6 +362,30 @@ class MRCPSPBlockBasedStaircase:
             print(f"  Min: {min(widths)}, Max: {max(widths)}")
             print(f"  Total precedence pairs: {len(self.precedence_widths)}")
 
+    def get_or_build_precedence_blocks(self, pred, succ):
+        """
+        Lấy (hoặc tạo-lần-đầu) danh sách block cho cung (pred->succ).
+        Đảm bảo: block đã được encode AMO và connect tuần tự đúng 1 lần.
+        """
+        key = (pred, succ)
+        blocks = self.precedence_blocks.get(key)
+        if blocks is None:
+            # Tạo block theo cung (cửa sổ hẹp, width thích nghi)
+            blocks = self.create_blocks_for_precedence(pred, succ)
+            blocks = sorted(blocks, key=lambda b: b[1])  # sort theo start time
+
+            # Encode AMO cho từng block (idempotent nhờ self.encoded_blocks)
+            for (bid, st, en, _bt, _a, _b) in blocks:
+                self.encode_amo_block(bid, succ, st, en)
+
+            # Connect các block trong CÙNG cung (idempotent nhờ self.connected_pairs)
+            for i in range(len(blocks) - 1):
+                self.connect_blocks(blocks[i][0], blocks[i + 1][0])
+
+            self.precedence_blocks[key] = blocks
+
+        return blocks
+
     def create_blocks_for_precedence(self, pred_job, succ_job):
         """
         Create blocks for successor based on precedence relationship
@@ -607,15 +631,10 @@ class MRCPSPBlockBasedStaircase:
             if pred not in self.precedence:
                 continue
             for succ in self.precedence[pred]:
-                # 1) Luôn dựng block THEO CUNG (pred->succ)
-                blocks = self.create_blocks_for_precedence(pred, succ)
-                blocks = sorted(blocks, key=lambda b: b[1])
-
-                # 2) Encode AMO cho từng block + nối chuỗi block trong CÙNG (pred->succ)
-                for (bid, st, en, _bt, _a, _b) in blocks:
-                    self.encode_amo_block(bid, succ, st, en)
-                for i in range(len(blocks) - 1):
-                    self.connect_blocks(blocks[i][0], blocks[i + 1][0])
+                # Lấy từ cache hoặc build 1 lần (encode + connect đã nằm trong helper)
+                blocks = self.get_or_build_precedence_blocks(pred, succ)
+                if not blocks:
+                    continue
 
                 # 3) Dùng các block này để "cấm prefix ≤ thr" như cũ
                 for m_pred, mode in enumerate(self.job_modes[pred]):
@@ -888,12 +907,15 @@ class MRCPSPBlockBasedStaircase:
         self.job_blocks = {}
         self.register_bits = {}
         self.block_connections = []
+
         self.stats = {
             'variables': 0,
             'clauses': 0,
             'register_bits': 0,
             'connection_clauses': 0,
         }
+        self.encoded_blocks = set()
+        self.connected_pairs = set()
 
         # Encode
         self.encode(makespan)
@@ -1105,7 +1127,7 @@ def run_precedence_aware_encoding(test_file=None):
         return None, None
 
     if test_file is None:
-        test_file = "data/j30/j3021_7.mm"
+        test_file = "data/j30/j3021_1.mm"
 
     print("=" * 100)
     print("TESTING PRECEDENCE-AWARE BLOCK-BASED ENCODING")
