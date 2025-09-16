@@ -1,5 +1,6 @@
 import os, subprocess
 
+
 def write_param(enc, out_path):
     """
     Ghi instance.param cho Savile Row từ encoder đang có:
@@ -8,43 +9,42 @@ def write_param(enc, out_path):
     - enc.R_capacity[], enc.N_capacity[]
     - enc.u_vars mask: key tồn tại => hợp lệ
     """
-    J  = enc.jobs
-    H  = enc.horizon
-    R  = enc.renewable_resources
-    N  = enc.nonrenewable_resources
-    Mmax = max(len(enc.job_modes[j]) for j in range(1, J+1)) if J>0 else 0
+    J = enc.jobs
+    H = enc.horizon
+    R = enc.renewable_resources
+    N = enc.nonrenewable_resources
+    Mmax = max(len(enc.job_modes[j]) for j in range(1, J + 1)) if J > 0 else 0
 
     # nModes[j]
-    nModes = [len(enc.job_modes[j]) for j in range(1, J+1)]
+    nModes = [len(enc.job_modes[j]) for j in range(1, J + 1)]
 
     # reqRen[j,m,k], reqNon[j,m,k]  (Essence 1-based j,m,k)
-    # Vector yêu cầu trong code của bạn: renew đứng trước, non-renew đứng sau. :contentReference[oaicite:3]{index=3}
-    reqRen = [[[0]*(R) for _ in range(Mmax)] for __ in range(J)]
-    reqNon = [[[0]*(N) for _ in range(Mmax)] for __ in range(J)]
-    for j in range(1, J+1):
+    reqRen = [[[0] * (R) for _ in range(Mmax)] for __ in range(J)]
+    reqNon = [[[0] * (N) for _ in range(Mmax)] for __ in range(J)]
+    for j in range(1, J + 1):
         for m in range(len(enc.job_modes[j])):
             vec = enc.job_modes[j][m][1]  # demands vector
             # renewables
             for k in range(R):
-                v = vec[k] if len(vec)>k and vec[k] is not None else 0
-                reqRen[j-1][m][k] = int(v)
+                v = vec[k] if len(vec) > k and vec[k] is not None else 0
+                reqRen[j - 1][m][k] = int(v)
             # non-renewables
             for k in range(N):
                 idx = R + k
-                v = vec[idx] if len(vec)>idx and vec[idx] is not None else 0
-                reqNon[j-1][m][k] = int(v)
+                v = vec[idx] if len(vec) > idx and vec[idx] is not None else 0
+                reqNon[j - 1][m][k] = int(v)
 
     # capacities
     capRen = [int(x) for x in enc.R_capacity]
     capNon = [int(x) for x in enc.N_capacity]
 
-    # validU[j,t,m]: 1 nếu U tồn tại (đúng như bạn dùng ở add_process_variable_constraints) :contentReference[oaicite:4]{index=4}
-    validU = [[[0]*Mmax for _ in range(H+1)] for __ in range(J)]
-    for j in range(1, J+1):
-        for t in range(H+1):
+    # validU[j,t,m]: 1 nếu U tồn tại (đúng như bạn dùng ở add_process_variable_constraints)
+    validU = [[[0] * Mmax for _ in range(H + 1)] for __ in range(J)]
+    for j in range(1, J + 1):
+        for t in range(H + 1):
             for m in range(len(enc.job_modes[j])):
                 if (j in enc.u_vars) and (t in enc.u_vars[j]) and (m in enc.u_vars[j][t]):
-                    validU[j-1][t][m] = 1
+                    validU[j - 1][t][m] = 1
 
     # Ghi Essence param (định dạng basic)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -62,11 +62,13 @@ def write_param(enc, out_path):
 
         # reqRen
         f.write("letting reqRen be ")
-        _dump_3d(f, reqRen); f.write("\n")
+        _dump_3d(f, reqRen);
+        f.write("\n")
 
         # reqNon
         f.write("letting reqNon be ")
-        _dump_3d(f, reqNon); f.write("\n")
+        _dump_3d(f, reqNon);
+        f.write("\n")
 
         # capRen
         f.write("letting capRen be [")
@@ -80,7 +82,9 @@ def write_param(enc, out_path):
 
         # validU
         f.write("letting validU be ")
-        _dump_3d(f, validU); f.write("\n")
+        _dump_3d(f, validU);
+        f.write("\n")
+
 
 def _dump_3d(f, arr):
     # Essence: matrix [[...],[...],...]
@@ -114,51 +118,127 @@ def run_savilerow(model_eprime, param_file, dimacs_out, aux_out,
             )
 
     model_eprime = os.path.abspath(model_eprime)
-    param_file   = os.path.abspath(param_file)
-    dimacs_out   = os.path.abspath(dimacs_out)
-    aux_out      = os.path.abspath(aux_out)
+    param_file = os.path.abspath(param_file)
+    dimacs_out = os.path.abspath(dimacs_out)
+    aux_out = os.path.abspath(aux_out)
     os.makedirs(os.path.dirname(dimacs_out), exist_ok=True)
 
+    # Thử nhiều cách để tránh lỗi Minion
     cmd = [
         "java", "-jar", jar,
         "-in-eprime", model_eprime,
-        "-in-param",  param_file,
+        "-in-param", param_file,
         "-sat",
-        "-out-sat",   dimacs_out,
+        "-out-sat", dimacs_out,
         "-save-symbols",
-        "-out-aux",   aux_out,
-        "-O2", "-S1",
+        "-out-aux", aux_out,
+        "-O0",  # Tắt optimization để tránh gọi Minion
+        "-no-bound-vars",  # Tắt domain filtering
     ]
-    if extra_flags:
-        if isinstance(extra_flags, str):
-            cmd.extend(shlex.split(extra_flags))
-        else:
-            cmd.extend(extra_flags)
 
-    subprocess.run(cmd, check=True)
+    # Bỏ extra_flags nếu có -O2 hoặc -S1
+    if extra_flags:
+        filtered_flags = []
+        for flag in extra_flags:
+            if not flag.startswith("-O") and not flag.startswith("-S"):
+                filtered_flags.append(flag)
+        if filtered_flags:
+            cmd.extend(filtered_flags)
+
+    # Chạy với error handling
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print("Savile Row completed successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"Savile Row stderr: {e.stderr}")
+        # Kiểm tra nếu file DIMACS đã được tạo thành công
+        if os.path.exists(dimacs_out) and os.path.getsize(dimacs_out) > 0:
+            print("DIMACS file was created despite the error, continuing...")
+        else:
+            raise e
+
 
 def parse_sr_varmap(varmap_path: str):
     """
-    Parse varmap Savile Row -> hai dict:
-      - sm_map[(j,m)] = dimacs_id
-      - u_map[(j,t,m)] = dimacs_id
-    Essence dùng 1-based cho j,m,t.
+    Parse varmap từ DIMACS file comments thay vì aux file
+    Vì aux file là Java serialized object
     """
     import re
+    import os
+
+    # Thay đổi: đọc từ DIMACS file thay vì aux
+    dimacs_path = varmap_path.replace('.aux', '.dimacs')
+
+    if not os.path.exists(dimacs_path):
+        print(f"Warning: DIMACS file not found at {dimacs_path}")
+        return {}, {}
+
     sm_map, u_map = {}, {}
-    pat_sm = re.compile(r"SM\[(\d+),\s*(\d+)\]\s*=\s*(\d+)")
-    pat_u  = re.compile(r"U\[(\d+),\s*(\d+),\s*(\d+)\]\s*=\s*(\d+)")
-    with open(varmap_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            m = pat_sm.search(line)
-            if m:
-                j, mm, vid = map(int, m.groups())
-                sm_map[(j, mm)] = int(vid)
-                continue
-            m = pat_u.search(line)
-            if m:
-                j, tt, mm, vid = map(int, m.groups())
-                u_map[(j, tt, mm)] = int(vid)
-                continue
-    return sm_map, u_map
+
+    try:
+        with open(dimacs_path, 'r', encoding='utf-8') as f:
+            current_var_name = None
+
+            for line_num, line in enumerate(f):
+                line = line.strip()
+
+                # Stop after processing reasonable number of comment lines
+                if line_num > 500000:  # Safety limit
+                    break
+
+                # Stop when we hit the problem line or non-comment
+                if line.startswith('p cnf'):
+                    break
+
+                if not line.startswith('c'):
+                    continue
+
+                # Look for variable encoding line
+                if 'Encoding variable:' in line:
+                    # Extract variable name
+                    m = re.search(r'Encoding variable: (\S+)', line)
+                    if m:
+                        current_var_name = m.group(1)
+
+                # Look for SAT variable assignment
+                elif 'Var represented with SAT variable' in line and current_var_name:
+                    m = re.search(r'SAT variable (\d+)', line)
+                    if m:
+                        sat_var = int(m.group(1))
+
+                        # Parse U variable (with padded zeros)
+                        if current_var_name.startswith('U_'):
+                            parts = current_var_name[2:].split('_')
+                            if len(parts) == 3:
+                                j = int(parts[0])
+                                t = int(parts[1])
+                                mode = int(parts[2])
+                                u_map[(j, t, mode)] = sat_var
+
+                        # Parse SM variable (with padded zeros)
+                        elif current_var_name.startswith('SM_'):
+                            parts = current_var_name[3:].split('_')
+                            if len(parts) == 2:
+                                j = int(parts[0])
+                                mode = int(parts[1])
+                                sm_map[(j, mode)] = sat_var
+
+                        current_var_name = None
+
+        print(f"Parsed from DIMACS: {len(sm_map)} SM vars and {len(u_map)} U vars")
+
+        # Debug: print some samples
+        if sm_map:
+            sample_sm = list(sm_map.items())[:3]
+            print(f"  Sample SM mappings: {sample_sm}")
+        if u_map:
+            sample_u = list(u_map.items())[:3]
+            print(f"  Sample U mappings: {sample_u}")
+
+        return sm_map, u_map
+
+    except Exception as e:
+        print(f"Error parsing DIMACS file: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}, {}

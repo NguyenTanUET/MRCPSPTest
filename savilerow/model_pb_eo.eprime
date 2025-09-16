@@ -6,43 +6,43 @@ given R : int
 given N : int
 given Mmax: int
 
-$ Miền chỉ số (ví dụ)
+$ Miền chỉ số
 letting Jobs  be domain int(1..J)
-letting Times be domain int(0..H)      $ lưu ý 0..H có H+1 thời điểm
+letting Times be domain int(0..H)
 letting Modes be domain int(1..Mmax)
 
 given nModes : matrix indexed by [Jobs] of int(1..Mmax)
+given validU : matrix indexed by [Jobs, Times, Modes] of int(0..1)
+given reqRen : matrix indexed by [Jobs, Modes, int(1..R)] of int(0..)
+given reqNon : matrix indexed by [Jobs, Modes, int(1..N)] of int(0..)
+given capRen : matrix indexed by [int(1..R)] of int(0..)
+given capNon : matrix indexed by [int(1..N)] of int(0..)
 
-given  validU : matrix indexed by [Jobs, Times, Modes] of int(0..1)
-given  reqRen : matrix indexed by [Jobs, Modes, int(1..R)] of int(0..)
-given  reqNon : matrix indexed by [Jobs, Modes, int(1..N)] of int(0..)
-given  capRen : matrix indexed by [int(1..R)] of int(0..)
-given  capNon : matrix indexed by [int(1..N)] of int(0..)
-
-find   U      : matrix indexed by [Jobs, Times, Modes] of bool
-find   SM     : matrix indexed by [Jobs, Modes] of bool
+find U  : matrix indexed by [Jobs, Times, Modes] of bool
+find SM : matrix indexed by [Jobs, Modes] of bool
 
 such that
-  $ 1) Tắt mode vượt nModes
-  forAll j : Jobs . forAll m1 : Modes .
-    ( m1 > nModes[j] -> !SM[j,m1] )
 
-/\ $ 2) EO: mỗi job đúng 1 mode
-  forAll j : Jobs .
-    ( sum m2 : Modes . toInt(SM[j,m2]) ) = 1
+$ 1) Tắt mode vượt nModes
+forAll j : Jobs . forAll m : Modes .
+    (m > nModes[j] -> !SM[j,m]),
 
-/\ $ 3) Tắt U không hợp lệ
-  forAll j : Jobs . forAll t1 : Times . forAll m3 : Modes .
-    ( validU[j,t1,m3] = 0 -> !U[j,t1,m3] )
+$ 2) EO: mỗi job đúng 1 mode
+forAll j : Jobs .
+    (sum m : Modes . toInt(SM[j,m])) = 1,
 
-/\ $ 4) Ràng buộc tài nguyên **renewable** theo từng (k,t)
-  forAll k1 : int(1..R) . forAll t2 : Times .
-    ( sum j2 : Jobs . sum m4 : Modes .
-        reqRen[j2,m4,k1] * toInt(U[j2,t2,m4])
-    ) <= capRen[k1]
+$ 3) Tắt U không hợp lệ
+forAll j : Jobs . forAll t : Times . forAll m : Modes .
+    (validU[j,t,m] = 0 -> !U[j,t,m]),
 
-/\ $ 5) Ràng buộc tài nguyên **non-renewable** theo từng k
-  forAll k2 : int(1..N) .
-    ( sum j3 : Jobs . sum m5 : Modes .
-        reqNon[j3,m5,k2] * toInt(SM[j3,m5])
-    ) <= capNon[k2]
+$ 4) Ràng buộc tài nguyên renewable theo từng (k,t)
+forAll k : int(1..R) . forAll t : Times .
+    (sum j : Jobs . sum m : Modes .
+        reqRen[j,m,k] * toInt(U[j,t,m])
+    ) <= capRen[k],
+
+$ 5) Ràng buộc tài nguyên non-renewable theo từng k
+forAll k : int(1..N) .
+    (sum j : Jobs . sum m : Modes .
+        reqNon[j,m,k] * toInt(SM[j,m])
+    ) <= capNon[k]

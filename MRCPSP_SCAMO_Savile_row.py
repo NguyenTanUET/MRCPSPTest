@@ -8,7 +8,8 @@ from pysat.solvers import Glucose42
 from savilerow.sr_bridge import write_param, run_savilerow, parse_sr_varmap
 import time
 import math
-
+import glob
+import os
 
 class MRCPSPBlockBasedStaircase:
     """MRCPSP Encoder với precedence-aware adaptive block width"""
@@ -873,8 +874,38 @@ class MRCPSPBlockBasedStaircase:
             run_savilerow(
                 sr_model, sr_param, sr_dimacs, sr_aux,
                 jar_path="/home/nguyentan/savilerow-1.10.1-linux/savilerow.jar",
-                extra_flags=["-sat-amo-ladder"]  # hoặc để trống
+                extra_flags=[]
             )
+
+            print("\n=== Checking created files ===")
+            output_dir = "savilerow_out"
+            if os.path.exists(output_dir):
+                files = glob.glob(os.path.join(output_dir, "*"))
+                for f in files:
+                    size = os.path.getsize(f)
+                    print(f"  {f}: {size} bytes")
+
+                    # Try to peek at aux file content
+                    if f.endswith(".aux"):
+                        try:
+                            with open(f, 'rb') as file:
+                                first_bytes = file.read(100)
+                                print(f"    First 100 bytes (hex): {first_bytes.hex()[:100]}")
+                                print(
+                                    f"    First 100 bytes (ascii ignore): {first_bytes.decode('ascii', 'ignore')[:100]}")
+                        except Exception as e:
+                            print(f"    Error reading: {e}")
+
+            # Also check if DIMACS file exists
+            if os.path.exists(sr_dimacs):
+                print(f"\nDIMACS file created: {sr_dimacs}")
+                with open(sr_dimacs, 'r') as f:
+                    lines = f.readlines()[:5]
+                    print(f"First 5 lines of DIMACS:")
+                    for line in lines:
+                        print(f"  {line.strip()}")
+            else:
+                print(f"\nWARNING: DIMACS file not found at {sr_dimacs}")
             # (4) nạp CNF nền của Savile Row
             base = CNF(from_file=sr_dimacs)
             self.cnf = base
@@ -882,12 +913,46 @@ class MRCPSPBlockBasedStaircase:
             # (5) parse varmap -> map SM & U về id DIMACS
             sm_map, u_map = parse_sr_varmap(sr_aux)
 
-            # (6) cài đặt self.sm_vars & self.u_vars từ map (Essence là 1-based)
+            # Debug: print what we got
+            print(f"Got {len(sm_map)} SM mappings and {len(u_map)} U mappings")
+            if len(sm_map) == 0 and len(u_map) == 0:
+                print("WARNING: No variable mappings found. Checking for alternative format...")
+
+                # Thử đọc trực tiếp từ DIMACS với format padding
+                import re
+                with open(sr_dimacs, 'r') as f:
+                    for line in f:
+                        if not line.startswith('c'):
+                            break
+                        # Try padded format: U_00001_00000_00001
+                        if 'U_' in line:
+                            m = re.search(r'U_(\d+)_(\d+)_(\d+).*SAT variable (\d+)', line + f.readline())
+                            if m:
+                                j, t, mode, sat_var = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                                u_map[(j, t, mode)] = sat_var
+                        # Try padded format: SM_00001_00001
+                        elif 'SM_' in line:
+                            m = re.search(r'SM_(\d+)_(\d+).*SAT variable (\d+)', line + f.readline())
+                            if m:
+                                j, mode, sat_var = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                                sm_map[(j, mode)] = sat_var
+
+            print(f"After alternative parsing: {len(sm_map)} SM, {len(u_map)} U")
+
+            # (6) cài đặt self.sm_vars & self.u_vars từ map
             self.sm_vars = {j: {} for j in range(1, self.jobs + 1)}
             for j in range(1, self.jobs + 1):
                 Mj = len(self.job_modes[j])
                 for m in range(Mj):
-                    self.sm_vars[j][m] = sm_map[(j, m + 1)]  # m+1 vì 1-based
+                    # Chú ý: Savile Row dùng index bắt đầu từ 1
+                    key = (j, m + 1)  # m+1 vì SR dùng 1-based
+                    if key in sm_map:
+                        self.sm_vars[j][m] = sm_map[key]
+                    else:
+                        print(f"Warning: SM[{j},{m + 1}] not found in map")
+                        # Tạo dummy variable nếu không tìm thấy
+                        self.sm_vars[j][m] = self.cnf.nv + 1
+                        self.cnf.nv += 1
 
             # đảm bảo u_vars tồn tại (sẽ được link với S & SM ở bước sau)
             if not hasattr(self, "u_vars") or not self.u_vars:
@@ -897,9 +962,10 @@ class MRCPSPBlockBasedStaircase:
                 Mj = len(self.job_modes[j])
                 for t in range(self.horizon + 1):
                     for m in range(Mj):
-                        key = (j, t, m + 1)
+                        key = (j, t, m + 1)  # m+1 vì SR dùng 1-based
                         if key in u_map:
                             self.u_vars[j][t][m] = u_map[key]
+                        # Không cần warning cho U vì nhiều combination không valid
 
             # (7) đặt vpool để các biến mới (S, y-register, …) sinh ra sau max var id hiện có
             if not hasattr(self, "vpool") or self.vpool is None:
