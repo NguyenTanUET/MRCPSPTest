@@ -766,7 +766,6 @@ class MRCPSPBlockBasedStaircase:
         renewable_clauses = clauses_after - clause_before
         print(f"Số clauses sinh ra từ add_renewable_resource_constraints: {renewable_clauses}")
 
-
     def add_nonrenewable_resource_constraints(self):
         """
         Non-renewable with EO-reduction (4.4.1/3.2.5) + fallback:
@@ -844,7 +843,6 @@ class MRCPSPBlockBasedStaircase:
         clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
         renewable_clauses = clauses_after - clause_before
         print(f"Số clauses sinh ra từ add_non_renewable_resource_constraints: {renewable_clauses}")
-
 
     def add_makespan_constraint(self, makespan):
         """Makespan constraint"""
