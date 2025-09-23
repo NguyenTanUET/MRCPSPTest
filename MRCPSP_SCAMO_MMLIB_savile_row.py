@@ -7,8 +7,9 @@ from pysat.formula import CNF, IDPool
 from pysat.solvers import Glucose42
 import time
 import math
-# === MMLIB50 Reader (chịu REQUESTS/DURATIONS có/không có ':') ===
 import re
+from pathlib import Path
+import os, re, uuid, subprocess, tempfile
 from pathlib import Path
 from copy import deepcopy
 
@@ -606,7 +607,6 @@ class MRCPSPBlockBasedStaircase:
         Each precedence pair gets its own block structure
         """
 
-        current_variable = self.va
         width = self.precedence_widths.get((pred_job, succ_job), 10)
 
         # Determine the relevant window for this precedence
@@ -1049,6 +1049,90 @@ class MRCPSPBlockBasedStaircase:
         renewable_clauses = clauses_after - clause_before
         print(f"Số clauses sinh ra từ add_non_renewable_resource_constraints: {renewable_clauses}")
 
+        def _sr_create_eprime_from_pbs(pbs, out_dir: str) -> str:
+            """
+            pbs: list of tuples (lits, weights, bound), với lits là các chỉ số biến SAT *đang dùng trong self.cnf*.
+            Chỉ encode dạng <= bound (AtMost). Với Exactly-One: dùng ALO (CNF) + AtMost bằng SR.
+            """
+            os.makedirs(out_dir, exist_ok=True)
+            eprime_path = os.path.join(out_dir, "pb_" + next(tempfile._get_candidate_names()) + ".eprime")
+
+            clauses = []
+            used = set()
+            for lits, weights, bound in pbs:
+                # Bỏ rỗng / vô nghĩa
+                if not lits:
+                    continue
+                if sum(weights) <= bound:
+                    continue
+                used.update(lits)
+                # xN trong eprime sẽ map về literal id N.
+                clause = "+".join(f"{w}*x{l}" for l, w in zip(lits, weights) if w != 0)
+                if clause:
+                    clauses.append(f"{clause}<={bound}")
+
+            with open(eprime_path, "w") as f:
+                f.write("language ESSENCE' 1.0\n")
+                for l in sorted(used):
+                    f.write(f"find x{l}: bool\n")
+                f.write("such that\n")
+                f.write("/\\\n".join(clauses))
+            return eprime_path
+
+        def _sr_run_and_get_dimacs(eprime_path: str, out_dir: str) -> str:
+            os.makedirs(out_dir, exist_ok=True)
+            dimacs_path = os.path.join(out_dir, "pb_" + Path(eprime_path).stem + ".dimacs")
+            # Tham số giống hệt pipeline hiện tại trong sat_solver.py
+            #   -sat -sat-pb-mdd -amo-detect -out-sat  (tạo DIMACS)
+            cmd = f"./bin/savilerow/savilerow {eprime_path} -sat -sat-pb-mdd -amo-detect -out-sat {dimacs_path}"
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return dimacs_path
+
+        def _sr_parse_dimacs_to_cnf(dimacs_path: str) -> list[list[int]]:
+            """
+            Đọc DIMACS kèm comment 'c Encoding variable: xK' để ánh xạ lại về literal gốc K.
+            Trả về danh sách mệnh đề (list of list[int]) dùng trực tiếp cho self.cnf.extend(...).
+            """
+            clauses = []
+            litmap = {}  # map từ SAT var id trong DIMACS -> literal id gốc (xK)
+            auxmap = {}  # map cho biến phụ (nếu cần)
+            with open(dimacs_path, "r") as f:
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    if line.startswith('p'):
+                        continue
+                    if line.startswith("c Encoding variable:"):
+                        var_line = line
+                        sat_line = f.readline()
+                        var_match = re.search(r'x(\\d+)', var_line)
+                        sat_match = re.search(r'(\\d+)', sat_line)
+                        if var_match and sat_match:
+                            litmap[int(sat_match.group(1))] = int(var_match.group(1))
+                        continue
+                    if line.startswith('c') or not line.strip():
+                        continue
+
+                    raw = [int(x) for x in line.strip().split()]
+                    cl = []
+                    for v in raw:
+                        if v == 0:
+                            continue
+                        av = abs(v)
+                        if av in litmap:
+                            g = litmap[av]  # trả về literal id gốc (xK -> K)
+                            cl.append(g if v > 0 else -g)
+                        else:
+                            # DIMACS có thể sinh biến phụ; ánh xạ sang id mới trong miền self.vpool
+                            if av not in auxmap:
+                                auxmap[av] = self.vpool.id()  # hoặc: self.vpool.top +=1; dùng IDPool chuẩn
+                            g = auxmap[av]
+                            cl.append(g if v > 0 else -g)
+                    if cl:
+                        clauses.append(cl)
+            return clauses
+    
     def add_makespan_constraint(self, makespan):
         """Makespan constraint"""
         sink_job = self.jobs

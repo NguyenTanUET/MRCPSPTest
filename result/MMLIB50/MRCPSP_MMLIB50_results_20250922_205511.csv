@@ -1,0 +1,21 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+J50100_1.mm,149,876079,7919748,57,Feasible,33.76,Yes,wall-time kill (parent)
+J50100_2.mm,148,780743,8584339,58,Feasible,33.44,Yes,wall-time kill (parent)
+J50100_3.mm,165,780610,8184502,60,Feasible,31.18,Yes,
+J50100_4.mm,136,784406,8266090,53,Feasible,33.48,Yes,wall-time kill (parent)
+J50100_5.mm,142,801667,8002416,56,Feasible,33.53,Yes,wall-time kill (parent)
+J50101_1.mm,39,0,0,,Infeasible,0.00,No,
+J50101_2.mm,44,0,0,,Infeasible,0.00,No,
+J50101_3.mm,38,0,0,,Infeasible,0.00,No,
+J50101_4.mm,38,747127,7377137,36,Optimal,19.29,No,
+J50101_5.mm,36,788197,8523445,36,Optimal,10.48,No,
+J50102_1.mm,134,799757,8650758,50,Feasible,33.84,Yes,wall-time kill (parent)
+J50102_2.mm,156,803048,8208026,56,Feasible,33.59,Yes,wall-time kill (parent)
+J50102_3.mm,114,857104,7743807,43,Feasible,33.68,Yes,wall-time kill (parent)
+J50102_4.mm,139,798357,9478716,61,Feasible,34.03,Yes,wall-time kill (parent)
+J50102_5.mm,161,808705,9864941,69,Feasible,33.66,Yes,wall-time kill (parent)
+J50103_1.mm,,0,0,,Feasible,33.68,Yes,wall-time kill (parent)
+J50103_2.mm,,0,0,,Feasible,33.66,Yes,wall-time kill (parent)
+J50103_3.mm,146,1563746,8715012,98,Feasible,33.72,Yes,wall-time kill (parent)
+J50103_4.mm,,0,0,,Feasible,33.71,Yes,wall-time kill (parent)
+J50103_5.mm,129,1684683,10459448,83,Feasible,33.67,Yes,wall-time kill (parent)

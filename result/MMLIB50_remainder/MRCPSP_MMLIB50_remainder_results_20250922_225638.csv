@@ -1,0 +1,11 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+J50103_1.mm,,0,0,,Feasible,18.15,Yes,wall-time kill (parent)
+J50103_2.mm,,0,0,,Feasible,18.13,Yes,wall-time kill (parent)
+J50103_3.mm,146,1563746,8715012,98,Feasible,18.10,Yes,wall-time kill (parent)
+J50103_4.mm,,0,0,,Feasible,18.59,Yes,wall-time kill (parent)
+J50103_5.mm,,0,0,,Feasible,18.14,Yes,wall-time kill (parent)
+J5010_1.mm,150,1830854,13523318,86,Feasible,18.20,Yes,wall-time kill (parent)
+J5010_2.mm,,0,0,,Feasible,18.13,Yes,wall-time kill (parent)
+J5010_3.mm,,0,0,,Feasible,18.18,Yes,wall-time kill (parent)
+J5010_4.mm,,0,0,,Feasible,18.13,Yes,wall-time kill (parent)
+J5010_5.mm,,0,0,,Feasible,18.14,Yes,wall-time kill (parent)

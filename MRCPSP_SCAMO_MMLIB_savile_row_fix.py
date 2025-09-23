@@ -8,8 +8,11 @@ from pysat.solvers import Glucose42
 import time
 import math
 # === MMLIB50 Reader (chịu REQUESTS/DURATIONS có/không có ':') ===
-import re
+import os, re, uuid, subprocess, tempfile
+import stat
+import shutil
 from pathlib import Path
+import subprocess
 from copy import deepcopy
 
 class MMLIB50Reader:
@@ -289,6 +292,27 @@ class MRCPSPBlockBasedStaircase:
             'register_bits': 0,
             'connection_clauses': 0,
         }
+
+    def _add_pb_via_savilerow(self, pb_list: list[tuple[list[int], list[int], int]], batch_size: int = 1200,
+                              tmp_dir: str = "sr_tmp", savilerow_bin: str = "/home/nguyentan/savilerow-1.10.1-linux/savilerow"):
+        """
+        Gom các PB (<=) rồi lần lượt:
+          pbs -> .eprime -> savilerow -> .dimacs -> clauses -> self.cnf.extend(...)
+        """
+        if not pb_list:
+            return
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        for i in range(0, len(pb_list), batch_size):
+            batch = pb_list[i:i + batch_size]
+            eprime = _sr_create_eprime_from_pbs(batch, tmp_dir)
+            dimacs = _sr_run_and_get_dimacs(eprime, tmp_dir, savilerow_bin=savilerow_bin)
+            cls = _sr_parse_dimacs_to_cnf(dimacs, self.vpool)
+            if cls:
+                self.cnf.extend(cls)
+                # nếu bạn có self.stats
+                if hasattr(self, "stats"):
+                    self.stats["clauses"] = len(self.cnf.clauses)
 
     def _remove_infeasible_and_dominated_modes(self):
         """1) Bỏ mode không khả thi (vượt capacity)  2) Bỏ mode bị chi phối (dominated)."""
@@ -823,15 +847,11 @@ class MRCPSPBlockBasedStaircase:
         for j in range(1, self.jobs + 1):
             mode_vars = [self.sm_vars[j][m] for m in range(len(self.job_modes[j]))]
             if len(mode_vars) <= 1:
-                # 0 hoặc 1 mode thì không cần encode thêm
                 continue
-            # Exactly-One: sum(mode_vars) == 1
-            pb = PBEnc.equals(lits=mode_vars,
-                              weights=[1] * len(mode_vars),
-                              bound=1,
-                              vpool=self.vpool,
-                              encoding=1)
-            self.cnf.extend(pb)
+            # ALO (≥1) – CNF trực tiếp
+            self.cnf.append(mode_vars)
+            # AMO (≤1) – SR
+            self._add_pb_via_savilerow([(mode_vars, [1] * len(mode_vars), 1)])
 
     def add_precedence_constraints_with_blocks(self):
         """Precedence using job-level SCAMO y-vars.
@@ -946,44 +966,35 @@ class MRCPSPBlockBasedStaircase:
                         self.stats['clauses'] += 1
 
     def add_renewable_resource_constraints(self):
-        """Renewable resource constraints"""
         clause_before = len(self.cnf.clauses)
+        pb_bucket = []  # gom PB để batch
+
         for k in range(self.renewable_resources):
             for t in range(self.horizon + 1):
-                resource_vars = []
-                resource_weights = []
-
+                lits, weights = [], []
                 for j in range(1, self.jobs + 1):
                     for m in range(len(self.job_modes[j])):
                         if m in self.u_vars[j][t]:
                             if len(self.job_modes[j][m][1]) > k:
-                                resource_req = self.job_modes[j][m][1][k]
-                                if resource_req > 0:
-                                    resource_vars.append(self.u_vars[j][t][m])
-                                    resource_weights.append(resource_req)
+                                req = self.job_modes[j][m][1][k]
+                                if req > 0:
+                                    lits.append(self.u_vars[j][t][m])
+                                    weights.append(req)
+                if lits:
+                    pb_bucket.append((lits, weights, self.R_capacity[k]))
 
-                if resource_vars:
-                    pb_constraint = PBEnc.atmost(resource_vars, resource_weights,
-                                                 self.R_capacity[k], vpool=self.vpool, encoding=5)
-                    self.cnf.extend(pb_constraint)
+        # Gọi SR 1–vài lần
+        self._add_pb_via_savilerow(pb_bucket, batch_size=1500)
 
-        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
-        renewable_clauses = clauses_after - clause_before
-        print(f"Số clauses sinh ra từ add_renewable_resource_constraints: {renewable_clauses}")
+        clauses_after = len(self.cnf.clauses)
+        print(f"Số clauses sinh ra từ add_renewable_resource_constraints (qua SR): {clauses_after - clause_before}")
 
     def add_nonrenewable_resource_constraints(self):
-        """
-        Non-renewable with EO-reduction (4.4.1/3.2.5) + fallback:
-          - m_i = min_o b_{iok}
-          - B'_k = B_k - sum_i m_i
-          - sum delta_{iok} * sm_{io} <= B'_k, where delta = max(0, b_{iok} - m_i)
-          - if B'_k < 0  -> fallback to plain PB: sum b_{iok} * sm_{io} <= B_k
-        """
         clause_before = len(self.cnf.clauses)
-        for k in range(self.nonrenewable_resources):
-            idx = self.renewable_resources + k  # cột non-renewable k trong vector yêu cầu
+        pb_bucket = []
 
-            # Tính m_i = min_o b_{iok} (mặc định 0 nếu job không có mode)
+        for k in range(self.nonrenewable_resources):
+            idx = self.renewable_resources + k
             mins_per_job = {}
             for j in range(1, self.jobs + 1):
                 vals = []
@@ -994,60 +1005,39 @@ class MRCPSPBlockBasedStaircase:
                 mins_per_job[j] = min(vals) if vals else 0
 
             sum_min = sum(mins_per_job.values())
-            Bk = self.N_capacity[k]
-            Bk_reduced = Bk - sum_min
+            Bk = self.N_capacity[k]  # chú ý đúng tên biến của bạn
+            Bk_prime = Bk - sum_min
 
-            # Xây lists biến & trọng số theo 2 phương án
-            def _plain_pb_lists():
-                resource_vars, resource_weights = [], []
+            if Bk_prime >= 0:
+                # EO reduction: sum_j sum_m delta_{jm} * sm_{jm} <= Bk'
+                lits, weights = [], []
                 for j in range(1, self.jobs + 1):
                     for m in range(len(self.job_modes[j])):
                         vec = self.job_modes[j][m][1]
                         v = vec[idx] if len(vec) > idx else 0
-                        v = 0 if v is None else int(v)
-                        if v > 0:
-                            resource_vars.append(self.sm_vars[j][m])
-                            resource_weights.append(v)
-                return resource_vars, resource_weights
-
-            def _eo_pb_lists():
-                resource_vars, resource_weights = [], []
-                for j in range(1, self.jobs + 1):
-                    m_i = mins_per_job[j]
-                    for m in range(len(self.job_modes[j])):
-                        vec = self.job_modes[j][m][1]
-                        v = vec[idx] if len(vec) > idx else 0
-                        v = 0 if v is None else int(v)
-                        delta = v - m_i
+                        delta = max(0, int(v) - mins_per_job[j])
                         if delta > 0:
-                            resource_vars.append(self.sm_vars[j][m])
-                            resource_weights.append(delta)
-                return resource_vars, resource_weights
-
-            if Bk_reduced < 0:
-                # basic PB
-                resource_vars, resource_weights = _plain_pb_lists()
-                if resource_vars:
-                    pb = PBEnc.atmost(lits=resource_vars,
-                                      weights=resource_weights,
-                                      bound=Bk,
-                                      vpool=self.vpool,
-                                      encoding=5)
-                    self.cnf.extend(pb)
+                            lits.append(self.sm_vars[j][m])
+                            weights.append(delta)
+                if lits:
+                    pb_bucket.append((lits, weights, Bk_prime))
             else:
-                # EO-reduction
-                resource_vars, resource_weights = _eo_pb_lists()
-                if resource_vars:
-                    pb = PBEnc.atmost(lits=resource_vars,
-                                      weights=resource_weights,
-                                      bound=Bk_reduced,
-                                      vpool=self.vpool,
-                                      encoding=5)
-                    self.cnf.extend(pb)
+                # Fallback: sum_j sum_m b_{jm} * sm_{jm} <= Bk
+                lits, weights = [], []
+                for j in range(1, self.jobs + 1):
+                    for m in range(len(self.job_modes[j])):
+                        vec = self.job_modes[j][m][1]
+                        v = vec[idx] if len(vec) > idx else 0
+                        if int(v) > 0:
+                            lits.append(self.sm_vars[j][m])
+                            weights.append(int(v))
+                if lits:
+                    pb_bucket.append((lits, weights, Bk))
 
-        clauses_after = len(self.cnf.clauses)  # Đếm số clauses sau khi thêm
-        renewable_clauses = clauses_after - clause_before
-        print(f"Số clauses sinh ra từ add_non_renewable_resource_constraints: {renewable_clauses}")
+        self._add_pb_via_savilerow(pb_bucket, batch_size=1500)
+
+        clauses_after = len(self.cnf.clauses)
+        print(f"Số clauses sinh ra từ add_nonrenewable_resource_constraints (qua SR): {clauses_after - clause_before}")
 
     def add_makespan_constraint(self, makespan):
         """Makespan constraint"""
@@ -1487,8 +1477,184 @@ def compute_ub_ssgs(mm_reader, restarts, seed):
 
     return best
 
+def _sr_create_eprime_from_pbs(pbs, out_dir: str) -> str:
+    """
+    pbs: list of (lits, weights, bound) cho ràng buộc sum(w_i * toInt(x_lit_i)) <= bound
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    eprime_path = os.path.join(out_dir, f"pb_{uuid.uuid4().hex}.eprime")
+
+    constraints = []
+    used = set()
+
+    for lits, weights, bound in pbs:
+        if not lits:
+            continue
+        # nếu tổng trọng số <= bound, ràng buộc vô hiệu -> bỏ
+        if sum(weights) <= bound:
+            continue
+        used.update(lits)
+        terms = [f"{w}*toInt(x{l})" for l, w in zip(lits, weights) if w]
+        if terms:
+            constraints.append(f"{' + '.join(terms)} <= {bound}")
+
+    with open(eprime_path, "w") as f:
+        f.write("language ESSENCE' 1.0\n")
+        # Khai báo biến bool; có thể gộp hoặc mỗi dòng 1 biến, đều được
+        for l in sorted(used):
+            f.write(f"find x{l} : bool\n")
+        f.write("such that\n")
+        if constraints:
+            # Dùng danh sách ràng buộc, ngăn cách bằng dấu phẩy (cú pháp Essence’ chuẩn)
+            f.write(",\n".join(constraints))
+        else:
+            f.write("true\n")
+
+    return eprime_path
+
+def _ensure_sr_bundle_exec(savilerow_bin: str):
+    """
+    Nếu savilerow_bin là thư mục bundle, tự +x cho savilerow và bin/*
+    Nếu là file savilerow, tự +x file đó.
+    Nếu là .jar thì bỏ qua.
+    """
+    sb = os.path.abspath(savilerow_bin)
+    p = Path(sb)
+    if p.suffix == ".jar":
+        return
+    try:
+        if p.is_dir():
+            exe = p / "savilerow"
+            if exe.exists():
+                st = os.stat(exe)
+                os.chmod(exe, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            bin_dir = p / "bin"
+            if bin_dir.exists() and bin_dir.is_dir():
+                for child in bin_dir.iterdir():
+                    if child.is_file():
+                        st = os.stat(child)
+                        os.chmod(child, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        else:
+            if os.path.isfile(sb) and not os.access(sb, os.X_OK):
+                st = os.stat(sb)
+                os.chmod(sb, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        # best-effort; không chặn luồng nếu chmod fail
+        pass
+
+def _is_executable_file(p: str) -> bool:
+    return os.path.isfile(p) and os.access(p, os.X_OK)
+
+import subprocess, shutil, os, stat
+from pathlib import Path
+
+def _sr_run_and_get_dimacs(eprime_path: str, out_dir: str, savilerow_bin: str = "./bin/savilerow/savilerow") -> str:
+    """
+    Chạy Savile Row để xuất DIMACS; in ra thông báo lỗi nếu fail.
+    """
+    _ensure_sr_bundle_exec(savilerow_bin)
+    os.makedirs(out_dir, exist_ok=True)
+    dimacs_path = os.path.join(out_dir, f"{Path(eprime_path).stem}.dimacs")
+
+    def _run(cmd_list):
+        # SR_DEBUG: nếu đặt SR_DEBUG=1 sẽ không nuốt log
+        if os.environ.get("SR_DEBUG") == "1":
+            proc = subprocess.run(cmd_list, text=True)
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd_list)
+        else:
+            proc = subprocess.run(cmd_list, capture_output=True, text=True)
+            if proc.returncode != 0:
+                msg = []
+                msg.append("Savile Row failed.")
+                msg.append(f"Command: {' '.join(cmd_list)}")
+                msg.append(f"STDOUT:\n{proc.stdout.strip()}")
+                msg.append(f"STDERR:\n{proc.stderr.strip()}")
+                raise RuntimeError("\n".join(msg))
+
+    sb = os.path.abspath(savilerow_bin)
+    p = Path(sb)
+
+    # Nếu là folder -> thử savilerow, rồi savilerow.jar
+    candidates = []
+    if p.is_dir():
+        candidates = [str(p / "savilerow"), str(p / "savilerow.jar")]
+    else:
+        candidates = [sb]
+
+    last_err = None
+    for cand in candidates:
+        try:
+            if cand.endswith(".jar") and os.path.isfile(cand):
+                java = shutil.which("java") or "java"
+                _run([java, "-Xmx2G", "-jar", cand, eprime_path, "-sat", "-sat-pb-mdd", "-amo-detect", "-out-sat", dimacs_path])
+                return dimacs_path
+
+            if os.path.isfile(cand) and not os.access(cand, os.X_OK):
+                st = os.stat(cand)
+                os.chmod(cand, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                _run([cand, eprime_path, "-sat", "-sat-pb-mdd", "-amo-detect", "-out-sat", dimacs_path])
+                return dimacs_path
+        except Exception as e:
+            last_err = e
+            continue
+
+    if last_err:
+        raise last_err
+    raise FileNotFoundError(f"Cannot locate runnable Savile Row at: {savilerow_bin}")
+
+
+def _sr_parse_dimacs_to_cnf(dimacs_path: str, vpool) -> list[list[int]]:
+    """
+    Đọc DIMACS và map biến 'xK' (từ comment 'c Encoding variable: xK') về literal gốc K.
+    Biến phụ do SR sinh sẽ được cấp id mới từ vpool.id().
+    Trả về list các mệnh đề (list[int]).
+    """
+    clauses = []
+    litmap = {}   # DIMACS var id -> original literal K
+    auxmap = {}   # DIMACS var id -> new id from vpool
+
+    with open(dimacs_path, "r") as f:
+        for line in f:
+            if not line.strip() or line[0] == 'p':
+                continue
+            if line.startswith("c Encoding variable:"):
+                # dòng sau thường chứa id DIMACS tương ứng
+                var_match = re.search(r'x(\d+)', line)
+                sat_line = next(f, "")
+                sat_match = re.search(r'(\d+)', sat_line)
+                if var_match and sat_match:
+                    litmap[int(sat_match.group(1))] = int(var_match.group(1))
+                continue
+            if line[0] == 'c':
+                continue
+            # mệnh đề
+            nums = [int(x) for x in line.split()]
+            if not nums:
+                continue
+            cl = []
+            for v in nums:
+                if v == 0:
+                    break
+                av = abs(v)
+                if av in litmap:
+                    g = litmap[av]
+                else:
+                    # biến phụ
+                    if av not in auxmap:
+                        auxmap[av] = vpool.id()
+                    g = auxmap[av]
+                cl.append(g if v > 0 else -g)
+            if cl:
+                clauses.append(cl)
+
+    return clauses
+
+
 if __name__ == "__main__":
-    DEFAULT_INSTANCE = "data/MMLIB50/J5010_2.mm"
+    DEFAULT_INSTANCE = "data/MMLIB50/J5066_2.mm"
     run_one_mmlib50(DEFAULT_INSTANCE, timeout_s=600)
 
 

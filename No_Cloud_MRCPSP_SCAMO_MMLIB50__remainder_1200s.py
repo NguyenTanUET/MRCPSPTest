@@ -1,5 +1,7 @@
 """
 MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
+Batch runner: quét toàn bộ .mm trong data/MMLIB50, giải với timeout 1200s/instance,
+ghi CSV định kỳ 10 dòng/lần vào result/MMLIB50/.
 """
 
 from pysat.pb import PBEnc
@@ -7,245 +9,25 @@ from pysat.formula import CNF, IDPool
 from pysat.solvers import Glucose42
 import time
 import math
-# === MMLIB50 Reader (chịu REQUESTS/DURATIONS có/không có ':') ===
-import re
 from pathlib import Path
-from copy import deepcopy
+import csv
+from datetime import datetime
+import multiprocessing as mp
+import subprocess, sys, json, os, signal, uuid, traceback
+from pathlib import Path  # nếu chưa có
 
-class MMLIB50Reader:
-    def __init__(self, filename: str):
-        self.filename = filename
-        self.data = self._read_file()
 
-    def _read_file(self):
-        text = Path(self.filename).read_text(encoding="utf-8", errors="ignore")
-        lines = [ln.rstrip() for ln in text.splitlines()]
-        data, idx, n = {}, 0, len(lines)
+# Các cột cố định trong CSV
+FIELDS = ["instance", "horizon", "variables", "clauses",
+          "makespan", "status", "Solve time", "timeout"]
 
-        jobs_pat = re.compile(r'(?i)^jobs.*?:\s*(\d+)\s*$')
-        ren_pat  = re.compile(r'(?i)-\s*renewable\s*:?\s*(\d+)\s*R')
-        non_pat  = re.compile(r'(?i)-\s*nonrenewable\s*:?\s*(\d+)\s*N')
 
-        # Header
-        while idx < n:
-            s = lines[idx].strip()
-            if not s: idx += 1; continue
-            m = jobs_pat.match(s)
-            if m: data['num_jobs'] = int(m.group(1)); idx += 1; continue
-            m = ren_pat.search(s)
-            if m: data['num_renewable'] = int(m.group(1)); idx += 1; continue
-            m = non_pat.search(s)
-            if m: data['num_nonrenewable'] = int(m.group(1)); idx += 1; continue
-            if re.match(r'(?i)^PRECEDENCE RELATIONS', s):
-                idx += 1; break
-            idx += 1
+def clean_row(row: dict) -> dict:
+    return {k: row.get(k, "") for k in FIELDS}
 
-        # Precedence
-        data['precedence'] = {}; data['num_modes'] = {}
-        while idx < n and (not lines[idx].strip() or lines[idx].lower().startswith("jobnr.") or set(lines[idx].strip()) in ({'-'}, {'*'})):
-            idx += 1
-
-        while idx < n:
-            s = lines[idx].strip()
-            if re.match(r'(?i)^REQUESTS/DURATIONS:?$', s):
-                idx += 1; break
-            if not s or s.lower().startswith("jobnr.") or set(s) in ({'-'}, {'*'}):
-                idx += 1; continue
-            parts = s.split()
-            if not parts[0].isdigit():
-                idx += 1; continue
-            j = int(parts[0])
-            if len(parts) >= 2 and parts[1].isdigit():
-                data['num_modes'][j] = int(parts[1])
-            succs = [int(t) for t in parts[3:] if t.isdigit()]
-            data['precedence'][j] = succs
-            idx += 1
-
-        # Requests/Durations
-        R = data.get('num_renewable', 0); N = data.get('num_nonrenewable', 0)
-        job_modes, cur = {}, None
-
-        while idx < n and (
-                not lines[idx].strip() or lines[idx].lower().startswith("jobnr.") or set(lines[idx].strip()) == {'-'}):
-            idx += 1
-
-        while idx < n:
-            s = lines[idx].strip()
-            # dừng khi tới RESOURCE AVAILABILITIES
-            if re.match(r'^\*{5,}$', s) or re.match(r'(?i)^RESOURCE AVAILABILITIES', s):
-                break
-            if not s:
-                idx += 1;
-                continue
-
-            parts = s.split()
-            # --- phân biệt bằng số cột ---
-            if parts[0].isdigit():
-                if len(parts) >= 3 + R + N:
-                    # DÒNG JOB MỚI: jobnr, mode, dur, R..., N...
-                    cur = int(parts[0])
-                    dur = int(parts[2])
-                    reqs = [int(x) for x in parts[3:3 + R + N]]
-                    job_modes.setdefault(cur, []).append((dur, reqs))
-                elif len(parts) >= 2 + R + N and cur is not None:
-                    # DÒNG MODE TIẾP THEO: mode, dur, R..., N...
-                    dur = int(parts[1])
-                    reqs = [int(x) for x in parts[2:2 + R + N]]
-                    job_modes.setdefault(cur, []).append((dur, reqs))
-                # nếu không đủ cột thì bỏ qua
-            # dòng khác -> bỏ
-            idx += 1
-
-        data['job_modes'] = job_modes
-
-        # Resource capacities
-        while idx < n and not re.match(r'(?i)^RESOURCE AVAILABILITIES', lines[idx].strip()):
-            idx += 1
-        if idx < n and re.match(r'(?i)^RESOURCE AVAILABILITIES', lines[idx].strip()):
-            idx += 1
-            while idx < n and not re.match(r'^\s*\d', lines[idx].strip()):
-                idx += 1
-            caps = []
-            if idx < n:
-                caps = [int(t) for t in lines[idx].split() if t.isdigit()]
-                idx += 1
-            data['renewable_capacity'] = caps[:R] if R else []
-            data['nonrenewable_capacity'] = caps[R:R+N] if N else []
-        else:
-            data['renewable_capacity'] = [0]*R
-            data['nonrenewable_capacity'] = [0]*N
-
-        # optional horizon
-        for ln in lines:
-            if ln.strip().lower().startswith("horizon"):
-                toks = ln.strip().split()
-                try: data['horizon'] = int(toks[-1])
-                except: pass
-                break
-
-        return data
-
-    def get_horizon(self):
-        if 'horizon' in self.data:
-            return self.data['horizon']
-        total = 0
-        for _, modes in self.data.get('job_modes', {}).items():
-            if modes: total += max(m[0] for m in modes)
-        return max(total, 1)
-def _critical_path_lb_mmlib(reader: MMLIB50Reader):
-    prec = reader.data.get('precedence', {})
-    modes = reader.data.get('job_modes', {})
-    memo = {}
-    def f(j):
-        if j in memo: return memo[j]
-        succs = prec.get(j, [])
-        succ_max = max((f(s) for s in succs), default=0)
-        dur_min = min((m[0] for m in modes.get(j, [])), default=0)
-        memo[j] = dur_min + succ_max
-        return memo[j]
-    return max(f(1), 1)
-
-def run_one_mmlib50(instance_path: str, timeout_s: int = 600):
-    """
-    Giải duy nhất 1 instance MMLIB50 với chiến lược:
-      - LB = max(CPM(d_min), Energetic LB)
-      - UB = min(horizon, UB từ SSGS)
-      - Duyệt giảm từ UB với bước thích ứng (halving) + quick filter energetic,
-    """
-    from time import time
-    print("=" * 100)
-    print("RUN ONE MMLIB50 INSTANCE")
-    print("=" * 100)
-    print(f"Instance: {instance_path}")
-
-    reader = MMLIB50Reader(instance_path)
-    enc = MRCPSPBlockBasedStaircase(reader)
-
-    # --- LB/UB ---
-    # Dữ liệu cho LB energetic lấy từ encoder (đã preprocess)
-    data_for_lb = {
-        'num_jobs': enc.jobs,
-        'num_renewable': enc.renewable_resources,
-        'num_nonrenewable': enc.nonrenewable_resources,
-        'renewable_capacity': enc.R_capacity,
-        'nonrenewable_capacity': enc.N_capacity,
-        'precedence': enc.precedence,
-        'job_modes': enc.job_modes,
-    }
-    lb_cpm    = enc.calculate_critical_path_bound()
-    lb_energy = compute_lb_energetic(data_for_lb)
-    lb        = max(lb_cpm, lb_energy)
-
-    ub_ssgs = compute_ub_ssgs(reader, restarts=16, seed=4000)  # bạn có thể chỉnh 8–16
-    ub      = min(reader.get_horizon(), ub_ssgs)
-    if ub < lb:
-        ub = lb
-
-    # --- Solve theo chiến lược energetic (descend + adaptive step) ---
-    t0 = time()
-    best_ms, best_model = None, None
-
-    # Thử UB trước (thường FEAS rất nhanh)
-    if time() - t0 <= timeout_s:
-        sol = enc.solve(ub)  # giữ nguyên solve() để in như cũ
-        if sol:
-            best_ms, best_model = ub, sol
-            if ub == lb:
-                dt = time() - t0
-                print(f"\n✓ Found feasible/optimal makespan = {best_ms} (time {dt:.2f}s)")
-                try:
-                    enc.print_solution(best_model, best_ms)
-                    enc.validate_solution(best_model)
-                except Exception:
-                    pass
-                return
-
-    # Giảm dần với bước thích ứng
-    B    = best_ms if best_ms is not None else ub
-    step = max(1, (ub - lb) // 4)
-
-    while step >= 1:
-        if time() - t0 > timeout_s:
-            break
-
-        cand = B - step
-        if cand < lb:
-            step //= 2
-            continue
-
-        # Quick filter energetic: dưới LB energetic thì bỏ qua, không encode
-        if cand < lb_energy:
-            lb = max(lb, cand + 1)
-            step //= 2
-            continue
-
-        sol = enc.solve(cand)  # giữ nguyên solve() để in như cũ
-
-        if time() - t0 > timeout_s:
-            break
-
-        if sol:
-            B = cand
-            best_ms, best_model = B, sol
-            if B == lb:
-                break
-            # vẫn giữ step để đi nhanh khi còn xa LB
-            continue
-        else:
-            # Gặp UNSAT thì thu hẹp bước
-            step //= 2
-            continue
-
-    dt = time() - t0
-    if best_ms is not None:
-        print(f"\n✓ Found feasible/optimal makespan = {best_ms} (time {dt:.2f}s)")
-        try:
-            enc.print_solution(best_model, best_ms)
-            enc.validate_solution(best_model)
-        except Exception:
-            pass
-    else:
-        print(f"\n✗ No solution within {timeout_s}s (lb={lb}, ub={ub})")
+# ==========================
+#  Phần ENCODER (giữ nguyên + bổ sung vài trường thống kê)
+# ==========================
 
 class MRCPSPBlockBasedStaircase:
     """MRCPSP Encoder với precedence-aware adaptive block width"""
@@ -289,6 +71,8 @@ class MRCPSPBlockBasedStaircase:
             'register_bits': 0,
             'connection_clauses': 0,
         }
+        self.last_var_count = 0
+        self.last_clause_count = 0
 
     def _remove_infeasible_and_dominated_modes(self):
         """1) Bỏ mode không khả thi (vượt capacity)  2) Bỏ mode bị chi phối (dominated)."""
@@ -302,14 +86,14 @@ class MRCPSPBlockBasedStaircase:
                 # renewables
                 for r in range(R):
                     if r < len(req) and req[r] > self.R_capacity[r]:
-                        ok = False;
+                        ok = False
                         break
                 # non-renewables
                 if ok:
                     for k in range(self.nonrenewable_resources):
                         idx = R + k
                         if idx < len(req) and req[idx] > self.N_capacity[k]:
-                            ok = False;
+                            ok = False
                             break
                 if ok:
                     feas.append((int(dur), list(map(int, req))))
@@ -322,7 +106,7 @@ class MRCPSPBlockBasedStaircase:
                     leq_all = (db <= da) and all(rb[i] <= ra[i] for i in range(len(ra)))
                     strict = (db < da) or any(rb[i] < ra[i] for i in range(len(ra)))
                     if leq_all and strict:
-                        dominated = True;
+                        dominated = True
                         break
                 if not dominated:
                     keep.append((da, ra))
@@ -373,7 +157,7 @@ class MRCPSPBlockBasedStaircase:
             for w in succ[u]:
                 for v in succ[u]:
                     if v != w and w in reach[v]:
-                        to_remove.add(w);
+                        to_remove.add(w)
                         break
             if to_remove:
                 succ[u] -= to_remove
@@ -392,7 +176,7 @@ class MRCPSPBlockBasedStaircase:
         succ = {u: set(self.precedence.get(u, [])) for u in range(1, self.jobs + 1)}
         indeg = {j: len(preds[j]) for j in preds}
         while q:
-            u = q.popleft();
+            u = q.popleft()
             order.append(u)
             for v in succ[u]:
                 indeg[v] -= 1
@@ -443,7 +227,7 @@ class MRCPSPBlockBasedStaircase:
         topo = []
         indeg = {j: len(preds[j]) for j in preds}
         while q:
-            u = q.popleft();
+            u = q.popleft()
             topo.append(u)
             for v in succ[u]:
                 indeg[v] -= 1
@@ -469,10 +253,10 @@ class MRCPSPBlockBasedStaircase:
                 must_j_before_i = (self.LS[i] < self.ES[j] + dmin[j])
 
                 if must_i_before_j and (pos.get(i, -1) < pos.get(j, 10 ** 9)):
-                    succ[i].add(j);
+                    succ[i].add(j)
                     added += 1
                 elif must_j_before_i and (pos.get(j, -1) < pos.get(i, 10 ** 9)):
-                    succ[j].add(i);
+                    succ[j].add(i)
                     added += 1
 
         if added > 0:
@@ -600,13 +384,35 @@ class MRCPSPBlockBasedStaircase:
             print(f"  Min: {min(widths)}, Max: {max(widths)}")
             print(f"  Total precedence pairs: {len(self.precedence_widths)}")
 
+    def get_or_build_precedence_blocks(self, pred, succ):
+        """
+        Lấy (hoặc tạo-lần-đầu) danh sách block cho cung (pred->succ).
+        Đảm bảo: block đã được encode AMO và connect tuần tự đúng 1 lần.
+        """
+        key = (pred, succ)
+        blocks = self.precedence_blocks.get(key)
+        if blocks is None:
+            # Tạo block theo cung (cửa sổ hẹp, width thích nghi)
+            blocks = self.create_blocks_for_precedence(pred, succ)
+            blocks = sorted(blocks, key=lambda b: b[1])  # sort theo start time
+
+            # Encode AMO cho từng block (idempotent nhờ self.encoded_blocks)
+            for (bid, st, en, _bt, _a, _b) in blocks:
+                self.encode_amo_block(bid, succ, st, en)
+
+            # Connect các block trong CÙNG cung (idempotent nhờ self.connected_pairs)
+            for i in range(len(blocks) - 1):
+                self.connect_blocks(blocks[i][0], blocks[i + 1][0])
+
+            self.precedence_blocks[key] = blocks
+
+        return blocks
+
     def create_blocks_for_precedence(self, pred_job, succ_job):
         """
         Create blocks for successor based on precedence relationship
         Each precedence pair gets its own block structure
         """
-
-        current_variable = self.va
         width = self.precedence_widths.get((pred_job, succ_job), 10)
 
         # Determine the relevant window for this precedence
@@ -638,11 +444,6 @@ class MRCPSPBlockBasedStaircase:
         # Store blocks for this precedence
         self.precedence_blocks[(pred_job, succ_job)] = blocks
 
-        # Also aggregate into job-level view
-        if succ_job not in self.job_blocks:
-            self.job_blocks[succ_job] = []
-        self.job_blocks[succ_job].extend(blocks)
-
         return blocks
 
     def create_blocks_for_job(self, job, width=None):
@@ -664,8 +465,10 @@ class MRCPSPBlockBasedStaircase:
         self.job_blocks[job] = blocks
         return blocks
 
-    def create_variables(self):
+    def create_variables(self, time_limit=None):
         """Create all variables"""
+        Tmax = (time_limit if time_limit is not None else self.horizon + 1)
+
         # s_{j,t} variables for start times
         self.s_vars = {}
         for j in range(1, self.jobs + 1):
@@ -684,15 +487,21 @@ class MRCPSPBlockBasedStaircase:
                 self.sm_vars[j][m] = var
                 self.stats['variables'] += 1
 
-        # u_{j,t,m} process variables
+        # u_{j,t,m} process variables  (BỎ MODE KHÔNG DÙNG RENEWABLE)
         self.u_vars = {}
         for j in range(1, self.jobs + 1):
             self.u_vars[j] = {}
-            for t in range(self.horizon + 1):
+            for t in range(Tmax):
                 self.u_vars[j][t] = {}
                 for m in range(len(self.job_modes[j])):
-                    duration = self.job_modes[j][m][0]
-                    if t - duration + 1 <= self.LS[j] and t >= self.ES[j]:
+                    dur, req = self.job_modes[j][m]
+                    # BỎ nếu mode không dùng tài nguyên tái tạo
+                    uses_any_R = any((k < self.renewable_resources and (len(req) > k and req[k] > 0))
+                                     for k in range(self.renewable_resources))
+                    if not uses_any_R and self.renewable_resources > 0:
+                        continue
+
+                    if t - dur + 1 <= self.LS[j] and t >= self.ES[j]:
                         var = self.vpool.id(f'u_{j}_{t}_{m}')
                         self.u_vars[j][t][m] = var
                         self.stats['variables'] += 1
@@ -834,25 +643,22 @@ class MRCPSPBlockBasedStaircase:
             self.cnf.extend(pb)
 
     def add_precedence_constraints_with_blocks(self):
-        """Precedence using job-level SCAMO y-vars.
-        For (pred->succ), if pred starts at t with mode m (dur=d), forbid succ start times ≤ t+d-1 by
-        setting certain prefix y-vars (or first x) to 0 via conditional clauses.
         """
-        current_variable = self.stats["variables"]
-        current_clauses = self.stats["clauses"]
-
+        Precedence per-edge blocks:
+        For (pred->succ), if pred starts at t with mode m (dur=d),
+        forbid succ start times ≤ t+d-1 using the AMO register bits of
+        the blocks created specifically for (pred, succ).
+        """
         for pred in range(1, self.jobs + 1):
             if pred not in self.precedence:
                 continue
             for succ in self.precedence[pred]:
-                # ensure succ blocks exist and encoded
-                if succ not in self.job_blocks or not self.job_blocks[succ]:
-                    blocks = self.create_blocks_for_job(succ)
-                    for (bid, st, en, _bt, _a, _b) in blocks:
-                        self.encode_amo_block(bid, succ, st, en)
-                    for i in range(len(blocks) - 1):
-                        self.connect_blocks(blocks[i][0], blocks[i + 1][0])
-                blocks = sorted(self.job_blocks[succ], key=lambda b: b[1])
+                # Lấy từ cache hoặc build 1 lần (encode + connect đã nằm trong helper)
+                blocks = self.get_or_build_precedence_blocks(pred, succ)
+                if not blocks:
+                    continue
+
+                # 3) Dùng các block này để "cấm prefix ≤ thr" như cũ
                 for m_pred, mode in enumerate(self.job_modes[pred]):
                     dur = mode[0]
                     for t_pred in range(self.ES[pred], self.LS[pred] + 1):
@@ -861,57 +667,66 @@ class MRCPSPBlockBasedStaircase:
                         thr = t_pred + dur - 1
                         if thr < self.ES[succ]:
                             continue
-                        # 1) For every block fully <= threshold: forbid entire block
+
+                        # (1) Cấm toàn bộ block hoàn toàn <= thr
                         for (bid, st, en, _bt, _a, _b) in blocks:
                             last_t = en - 1
                             if last_t <= thr and st <= last_t:
                                 y, x = self.create_register_bits_for_block(bid, succ, st, en)
                                 k = len(x)
                                 if k == 1:
-                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
+                                    self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                     -self.s_vars[pred][t_pred],
+                                                     -x[0]])
                                     self.stats['clauses'] += 1
                                 elif k >= 2:
-                                    self.cnf.append(
-                                        [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[k - 2]])
-                                    self.cnf.append(
-                                        [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
+                                    # (¬sm ∨ ¬s_pred_t ∨ ¬y[k-2]), (¬sm ∨ ¬s_pred_t ∨ ¬x[k-1])
+                                    self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                     -self.s_vars[pred][t_pred],
+                                                     -y[k - 2]])
+                                    self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                     -self.s_vars[pred][t_pred],
+                                                     -x[k - 1]])
                                     self.stats['clauses'] += 2
 
-                        # 2) For the block that contains threshold: forbid up to (thr)
+                        # (2) Cấm phần prefix trong block chứa thr
                         for (bid, st, en, _bt, _a, _b) in blocks:
                             if st <= thr < en:
                                 y, x = self.create_register_bits_for_block(bid, succ, st, en)
                                 k = len(x)
                                 idx = thr - st
                                 if idx == 0:
-                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
+                                    self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                     -self.s_vars[pred][t_pred],
+                                                     -x[0]])
                                     self.stats['clauses'] += 1
                                 elif idx < k - 1:
-                                    self.cnf.append([-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[idx]])
+                                    self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                     -self.s_vars[pred][t_pred],
+                                                     -y[idx]])
                                     self.stats['clauses'] += 1
                                 else:  # idx == k-1
                                     if k == 1:
-                                        self.cnf.append(
-                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[0]])
+                                        self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                         -self.s_vars[pred][t_pred],
+                                                         -x[0]])
                                         self.stats['clauses'] += 1
                                     else:
-                                        self.cnf.append(
-                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -y[k - 2]])
-                                        self.cnf.append(
-                                            [-self.sm_vars[pred][m_pred], -self.s_vars[pred][t_pred], -x[k - 1]])
+                                        self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                         -self.s_vars[pred][t_pred],
+                                                         -y[k - 2]])
+                                        self.cnf.append([-self.sm_vars[pred][m_pred],
+                                                         -self.s_vars[pred][t_pred],
+                                                         -x[k - 1]])
                                         self.stats['clauses'] += 2
-                                break  # only one containing block
+                                break  # chỉ 1 block chứa thr
 
-        staircase_variable = self.stats["variables"] - current_variable
-        staircase_clauses =  self.stats["clauses"] - current_clauses
-
-        print(f"Number of STAIRCASE variables: {staircase_variable}")
-        print(f"Number of STAIRCASE clauses: {staircase_clauses}")
-
-    def add_process_variable_constraints(self):
+    def add_process_variable_constraints(self, time_limit=None):
         """Define process variables"""
+        Tmax = (time_limit if time_limit is not None else self.horizon + 1)
+
         for j in range(1, self.jobs + 1):
-            for t in range(self.horizon + 1):
+            for t in range(Tmax):
                 for m in range(len(self.job_modes[j])):
                     if m not in self.u_vars[j][t]:
                         continue
@@ -945,11 +760,13 @@ class MRCPSPBlockBasedStaircase:
                         self.cnf.append([-self.u_vars[j][t][m]])
                         self.stats['clauses'] += 1
 
-    def add_renewable_resource_constraints(self):
+    def add_renewable_resource_constraints(self, time_limit=None):
         """Renewable resource constraints"""
+        Tmax = (time_limit if time_limit is not None else self.horizon + 1)
+
         clause_before = len(self.cnf.clauses)
         for k in range(self.renewable_resources):
-            for t in range(self.horizon + 1):
+            for t in range(Tmax):
                 resource_vars = []
                 resource_weights = []
 
@@ -1059,44 +876,20 @@ class MRCPSPBlockBasedStaircase:
                 self.stats['clauses'] += 1
 
     def encode(self, makespan=None):
-        """Encode with precedence-aware blocks"""
-        print("\n=== ENCODING WITH PRECEDENCE-AWARE BLOCKS ===")
-
-        print("Creating variables...")
+        """Encode và cập nhật last_var_count/last_clause_count để ghi CSV"""
         self.create_variables()
-
-        print("Adding start time constraints...")
         self.add_start_time_constraints()
-
-        print("Adding mode selection constraints...")
         self.add_mode_selection_constraints()
-
-        print("Adding precedence constraints with adaptive blocks...")
         self.add_precedence_constraints_with_blocks()
-
-        print("Adding process variable constraints...")
         self.add_process_variable_constraints()
-
-        print("Adding renewable resource constraints...")
         self.add_renewable_resource_constraints()
-
-        print("Adding non-renewable resource constraints...")
         self.add_nonrenewable_resource_constraints()
-
         if makespan is not None:
-            print(f"Adding makespan constraint: {makespan}")
             self.add_makespan_constraint(makespan)
-
+        # cập nhật đếm biến/mệnh đề
         self.stats['clauses'] = len(self.cnf.clauses)
-
-        print(f"\n=== ENCODING STATISTICS ===")
-        print(f"Total variables: {self.vpool.top if hasattr(self.vpool, 'top') else self.vpool._top}")
-        print(f"  - Basic vars: {self.stats['variables']}")
-        print(f"  - Register bits: {self.stats['register_bits']}")
-        print(f"Total clauses: {self.stats['clauses']}")
-        print(f"Connection clauses: {self.stats['connection_clauses']}")
-        print(f"Precedence pairs encoded: {len(self.precedence_widths)}")
-
+        self.last_clause_count = self.stats['clauses']
+        self.last_var_count = self.vpool.top if hasattr(self.vpool, 'top') else getattr(self.vpool, '_top', 0)
         return self.cnf
 
     def solve(self, makespan):
@@ -1110,12 +903,15 @@ class MRCPSPBlockBasedStaircase:
         self.job_blocks = {}
         self.register_bits = {}
         self.block_connections = []
+
         self.stats = {
             'variables': 0,
             'clauses': 0,
             'register_bits': 0,
             'connection_clauses': 0,
         }
+        self.encoded_blocks = set()
+        self.connected_pairs = set()
 
         # Encode
         self.encode(makespan)
@@ -1316,6 +1112,13 @@ class MRCPSPBlockBasedStaircase:
 
         return valid
 
+# ==========================
+#  Hàm tiện ích đọc .mm
+# ==========================
+def load_reader(mm_path):
+    from MRCPSP_SCAMO_MMLIB import MMLIB50Reader  # dùng reader cho MMLIB
+    return MMLIB50Reader(str(mm_path))
+
 def compute_lb_energetic(data):
     """
     LB = max( LB_crit(d_min), max_k ceil( sum_j min_m d_{jm} * r_{jmk} / C_k ) )
@@ -1487,8 +1290,332 @@ def compute_ub_ssgs(mm_reader, restarts, seed):
 
     return best
 
+
+# ==========================
+#  Giải 1 instance với timeout & nhị phân makespan
+# ==========================
+def _atomic_dump_json(path: Path, payload: dict):
+    tmp = Path(str(path) + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)  # atomic rename
+
+def solve_instance_with_timeout(mm_path, timeout_s=1200, checkpoint_path: Path | None = None):
+    reader = load_reader(mm_path)
+    enc = MRCPSPBlockBasedStaircase(reader)
+
+    data_for_lb = {
+        'num_jobs': enc.jobs,
+        'num_renewable': enc.renewable_resources,
+        'num_nonrenewable': enc.nonrenewable_resources,
+        'renewable_capacity': enc.R_capacity,
+        'nonrenewable_capacity': enc.N_capacity,
+        'precedence': enc.precedence,
+        'job_modes': enc.job_modes,
+    }
+
+    # LB cơ bản (CPM) + nâng bằng energetic LB
+    lb_cpm = enc.calculate_critical_path_bound()
+    lb_energy = compute_lb_energetic(data_for_lb)
+    lb = max(lb_cpm, lb_energy)
+
+    # UB khởi tạo
+    ub_ssgs = compute_ub_ssgs(reader, restarts=16, seed=4000)
+    ub = min(reader.get_horizon(), ub_ssgs)
+
+    start = time.time()
+    timeout_flag = False
+    best_makespan = None
+    best_vars = 0
+    best_clauses = 0
+
+    lo, hi = lb, ub
+    while lo <= hi:
+        if time.time() - start > timeout_s:
+            timeout_flag = True
+            break
+
+        mid = (lo + hi) // 2
+
+        # Quick filter: nếu mid < energetic LB => chắc chắn infeasible, skip SAT
+        if mid < lb_energy:
+            lo = mid + 1
+            continue
+
+        solution = enc.solve(mid)
+
+        if time.time() - start > timeout_s:
+            timeout_flag = True
+
+        if solution:
+            # cập nhật best-so-far
+            best_makespan = mid
+            best_vars = enc.last_var_count
+            best_clauses = enc.last_clause_count
+            # nếu đã bằng LB thì tối ưu luôn, thoát sớm
+            if mid == lb:
+                break
+            hi = mid - 1
+
+            # ghi checkpoint ngay khi có nghiệm mới
+            if checkpoint_path is not None:
+                _atomic_dump_json(checkpoint_path, {
+                    "instance": Path(mm_path).name,
+                    "horizon": ub,
+                    "variables": best_vars,
+                    "clauses": best_clauses,
+                    "makespan": best_makespan,
+                    "status": "Feasible",
+                    "Solve time": f"{time.time()-start:.2f}",
+                    "timeout": "No",
+                    "error": ""
+                })
+        else:
+            lo = mid + 1
+
+        if timeout_flag:
+            break
+
+    total_time = time.time() - start
+    if timeout_flag:
+        status = "Feasible"  # theo yêu cầu của bạn
+    else:
+        status = "Optimal" if best_makespan is not None else "Infeasible"
+
+    row = {
+        "instance": Path(mm_path).name,
+        "horizon": ub,
+        "variables": best_vars if best_makespan is not None else enc.last_var_count,
+        "clauses": best_clauses if best_makespan is not None else enc.last_clause_count,
+        "makespan": best_makespan if best_makespan is not None else "",
+        "status": status,
+        "Solve time": f"{total_time:.2f}",
+        "timeout": "Yes" if timeout_flag else "No",
+        "error": ""
+    }
+    return row
+
+
+# ==========================
+#  WORKER chế độ 1-instance (subprocess)
+# ==========================
+def _worker_main():
+    """
+    Chạy trong chế độ worker: giải đúng 1 instance rồi ghi JSON ra file --out.
+    """
+    import argparse, gc
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--mm", required=True, help="Đường dẫn file .mm")
+    parser.add_argument("--timeout", type=int, default=1200)
+    parser.add_argument("--out", required=True, help="Đường dẫn file JSON output")
+    args = parser.parse_args()
+
+    mm_path = Path(args.mm)
+    out_path = Path(args.out)
+
+    try:
+        row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+    except Exception as e:
+        tb = traceback.format_exc()
+        row = {"instance": mm_path.name, "horizon": "",
+               "variables": 0, "clauses": 0,
+               "makespan": "", "status": "Error",
+               "Solve time": "0.00", "timeout": "No",
+               "error": f"{e}\n{tb}"}
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(row, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+TMP_DIR = Path("tmp_results")  # chỗ chứa JSON tạm
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
+    out_final = TMP_DIR / f"{mm_path.stem}__{uuid.uuid4().hex}.json"
+    out_part  = TMP_DIR / (out_final.name + ".part")
+
+    cmd = [
+        sys.executable, "-u", __file__,
+        "--worker",
+        "--mm", str(mm_path),
+        "--out", str(out_part),
+        "--timeout", str(time_limit),
+    ]
+
+    wall = time_limit + 1
+    t0 = time.time()
+    # Quan trọng: không PIPE stdout để tránh treo vì đầy buffer
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,          # <- tránh block do log
+        stderr=subprocess.PIPE,             # giữ stderr để chẩn đoán nếu fail
+        text=True,
+        start_new_session=True,             # để kill theo group
+    )
+    try:
+        _, err = proc.communicate(timeout=wall)
+    except subprocess.TimeoutExpired:
+        # quá hạn: kill cả group (solver con, v.v.)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        try:
+            proc.wait(5)
+        except Exception:
+            pass
+
+        # Thử đọc checkpoint nếu có
+        data = None
+        if out_part.exists():
+            for _ in range(10):  # retry ngắn
+                try:
+                    with open(out_part, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    break
+                except json.JSONDecodeError:
+                    time.sleep(0.1)
+
+        if data is not None:
+            data["timeout"] = "Yes"
+            data["status"] = "Feasible"
+            data["Solve time"] = f"{time.time() - t0:.2f}"
+            data["error"] = "wall-time kill (parent)"
+            return data
+
+        # fallback nếu không có checkpoint
+        return {
+            "instance": mm_path.name, "horizon": "",
+            "variables": 0, "clauses": 0,
+            "makespan": "", "status": "Feasible",  # cũng để Feasible khi timeout
+            "Solve time": f"{time.time() - t0:.2f}",
+            "timeout": "Yes",
+            "error": "wall-time kill (parent)"
+        }
+
+    # Worker xong: nếu có file .part thì rename atomically
+    if out_part.exists():
+        try:
+            out_part.replace(out_final)
+        except Exception:
+            pass
+
+    # Đọc JSON với retry ngắn (tránh đọc sớm)
+    data = None
+    for _ in range(25):  # ~2.5s
+        if out_final.exists():
+            try:
+                with open(out_final, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                break
+            except json.JSONDecodeError:
+                time.sleep(0.1)
+        else:
+            time.sleep(0.1)
+
+    if data is None:
+        err_msg = (err or "").strip() if proc.returncode else "no-json"
+        return {
+            "instance": mm_path.name, "horizon": "",
+            "variables": 0, "clauses": 0,
+            "makespan": "", "status": "Error",
+            "Solve time": f"{time.time()-t0:.2f}",
+            "timeout": "No",
+            "error": f"missing worker JSON; rc={proc.returncode}; stderr={err_msg[:500]}"
+        }
+    return data
+
+# ==========================
+#  Chạy hàng loạt & ghi CSV + upload GCS
+# ==========================
+def run_batch_MMLIB50(
+    data_dir="data/MMLIB50_remainder",
+    out_dir="result/MMLIB50_remainder",
+    timeout_s=1200,
+):
+    """
+    Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
+    gs://<gcs_bucket>/<gcs_prefix>/<csv_filename>
+    """
+    data_path = Path(data_dir)
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # chuẩn bị sandbox worker & file CSV
+    script_path = Path(__file__).resolve()
+    tmp_dir = out_path / "_tmp_worker"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_file = out_path / f"MRCPSP_MMLIB50_remainder_results_{ts}.csv"
+
+    fields = ["instance", "horizon", "variables", "clauses",
+              "makespan", "status", "Solve time", "timeout", "error"]
+
+    results = []
+    mm_files = sorted(data_path.glob("*.mm"))
+    print(f"Found {len(mm_files)} instances in {data_path}")
+
+    # Ghi header ngay khi tạo file
+    with csv_file.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+
+
+    for idx, mm in enumerate(mm_files, start=1):
+        print(f"[{idx}/{len(mm_files)}] Solving {mm.name} ...")
+        try:
+            # CHẠY TRONG SUBPROCESS CÁCH LY RAM/exit(0)
+            row = _run_worker_for_instance(mm, timeout_s)
+        except Exception as e:
+            print(f"  -> Error instance {mm.name}: {e}")
+            row = {
+                "instance": mm.name, "horizon": "", "variables": 0, "clauses": 0,
+                "makespan": "", "status": "Error", "Solve time": "0.00",
+                "timeout": "No", "error": "parent call error"
+            }
+
+        results.append(row)
+
+        # Ghi theo lô mỗi 10 dòng
+        if idx % 10 == 0:
+            with csv_file.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+                writer.writerows(results[-10:])
+            print(f"  ✓ Đã lưu tạm 10 dòng vào {csv_file}")
+
+    # Ghi nốt phần còn lại (<10 cuối)
+    remainder = len(results) % 10
+    if remainder:
+        with csv_file.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+            writer.writerows(results[-remainder:])
+        print(f"  ✓ Đã lưu phần còn lại ({remainder} dòng) vào {csv_file}")
+
+    return csv_file
+
+# ==========================
+#  Entry point
+# ==========================
 if __name__ == "__main__":
-    DEFAULT_INSTANCE = "data/MMLIB50/J5010_2.mm"
-    run_one_mmlib50(DEFAULT_INSTANCE, timeout_s=600)
+    # Nếu được gọi như worker (chạy 1 instance duy nhất)
+    if "--worker" in sys.argv:
+        _worker_main()
+        sys.exit(0)
 
-
+    # Chế độ batch (cloud)
+    run_batch_MMLIB50(
+        data_dir="data/MMLIB50_remainder",
+        out_dir="result/MMLIB50_remainder",
+        timeout_s=1200,
+    )

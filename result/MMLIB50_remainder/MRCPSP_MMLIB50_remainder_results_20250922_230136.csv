@@ -1,0 +1,41 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+J50103_1.mm,154,1788449,10660879,69,Feasible,1201.27,Yes,wall-time kill (parent)
+J50103_2.mm,156,1645735,8907410,88,Feasible,1201.33,Yes,wall-time kill (parent)
+J50103_3.mm,146,1563746,8715043,67,Feasible,1201.32,Yes,wall-time kill (parent)
+J50103_4.mm,122,1818830,10893766,59,Optimal,520.60,No,
+J50103_5.mm,129,1684683,10459470,61,Optimal,891.16,No,
+J5010_1.mm,150,1830854,13523367,37,Feasible,1201.31,Yes,wall-time kill (parent)
+J5010_2.mm,150,1742520,13432060,44,Feasible,1201.39,Yes,wall-time kill (parent)
+J5010_3.mm,158,1877121,13691331,30,Feasible,1201.31,Yes,wall-time kill (parent)
+J5010_4.mm,137,1638183,11995763,37,Feasible,1201.31,Yes,wall-time kill (parent)
+J5010_5.mm,149,1814420,14560135,44,Feasible,1201.29,Yes,wall-time kill (parent)
+J5011_1.mm,32,1679380,13670127,28,Feasible,1207.49,Yes,wall-time kill (parent)
+J5011_2.mm,144,1668991,11988112,29,Feasible,1221.35,Yes,wall-time kill (parent)
+J5011_3.mm,144,1489886,11772895,29,Feasible,1223.89,Yes,wall-time kill (parent)
+J5011_4.mm,35,1765779,13247287,28,Feasible,1226.38,Yes,wall-time kill (parent)
+J5011_5.mm,36,1627238,13884785,30,Feasible,1228.72,Yes,wall-time kill (parent)
+J5012_1.mm,147,1712389,12744153,31,Feasible,1229.58,Yes,wall-time kill (parent)
+J5012_2.mm,159,1604647,14534480,32,Feasible,1230.37,Yes,wall-time kill (parent)
+J5012_3.mm,127,1724103,13446607,26,Feasible,1232.54,Yes,wall-time kill (parent)
+J5012_4.mm,148,1895270,12372147,30,Feasible,1235.34,Yes,wall-time kill (parent)
+J5012_5.mm,137,1659844,11773728,30,Feasible,1234.21,Yes,wall-time kill (parent)
+J5013_1.mm,162,973795,10216925,26,Feasible,1234.51,Yes,wall-time kill (parent)
+J5019_1.mm,149,2006298,11977434,29,Feasible,1236.48,Yes,wall-time kill (parent)
+J5019_2.mm,170,2329637,15262319,27,Optimal,708.22,No,
+J5019_3.mm,169,2230923,13948904,31,Optimal,502.90,No,
+J5019_4.mm,153,2318652,14139182,25,Optimal,838.76,No,
+J5019_5.mm,136,2409144,14371932,28,Optimal,840.71,No,
+J501_1.mm,159,813356,10734443,31,Optimal,1039.76,No,
+J501_2.mm,156,883820,12997328,25,Optimal,978.51,No,
+J501_4.mm,142,797574,9316333,29,Optimal,535.77,No,
+J5020_2.mm,141,2067345,12934650,26,Feasible,1220.46,Yes,wall-time kill (parent)
+J5020_4.mm,139,2161122,12581675,27,Feasible,1218.01,Yes,wall-time kill (parent)
+J5020_5.mm,153,2125899,14029457,29,Feasible,1205.05,Yes,wall-time kill (parent)
+J5021_1.mm,148,2117734,14336713,20,Feasible,1201.39,Yes,wall-time kill (parent)
+J5021_5.mm,128,2085363,13016085,18,Feasible,1201.38,Yes,wall-time kill (parent)
+J5022_1.mm,164,2160459,14106020,22,Feasible,1201.40,Yes,wall-time kill (parent)
+J5022_5.mm,164,2214407,15058784,23,Feasible,1201.42,Yes,wall-time kill (parent)
+J5023_4.mm,19,2296498,15356296,17,Feasible,1201.27,Yes,wall-time kill (parent)
+J5024_1.mm,144,2100694,13068018,17,Feasible,1201.34,Yes,wall-time kill (parent)
+J5025_2.mm,148,1063776,10639914,34,Feasible,1201.21,Yes,wall-time kill (parent)
+J5025_3.mm,159,1061036,11361408,26,Optimal,692.13,No,

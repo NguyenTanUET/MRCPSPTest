@@ -1,6 +1,6 @@
 """
 MRCPSP Block-Based Staircase Encoding với Precedence-Aware Adaptive Width
-Batch runner: quét toàn bộ .mm trong data/MMLIB50, giải với timeout 600s/instance,
+Batch runner: quét toàn bộ .mm trong data/MMLIB50, giải với timeout 31s/instance,
 ghi CSV định kỳ 10 dòng/lần vào result/MMLIB50/.
 """
 
@@ -1119,6 +1119,177 @@ def load_reader(mm_path):
     from MRCPSP_SCAMO_MMLIB import MMLIB50Reader  # dùng reader cho MMLIB
     return MMLIB50Reader(str(mm_path))
 
+def compute_lb_energetic(data):
+    """
+    LB = max( LB_crit(d_min), max_k ceil( sum_j min_m d_{jm} * r_{jmk} / C_k ) )
+    data: dict với các khóa như encoder dùng (num_jobs, num_renewable, ...).
+    """
+    J = data['num_jobs']
+    R = data['num_renewable']
+    C = data['renewable_capacity']
+    modes = data['job_modes']
+    prec = data['precedence']
+
+    # 1) Critical path bound với d_min
+    dmin = {j: min(d for d, _ in modes[j]) for j in range(1, J+1)}
+    from collections import deque
+    succ = {i: set(prec.get(i, [])) for i in range(1, J+1)}
+    indeg = {i: 0 for i in range(1, J+1)}
+    for u, vs in succ.items():
+        for v in vs:
+            indeg[v] += 1
+    q = deque([i for i in range(1, J+1) if indeg[i] == 0])
+    topo = []
+    while q:
+        u = q.popleft()
+        topo.append(u)
+        for v in succ[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+    ES = {j: 0 for j in range(1, J+1)}
+    for u in topo:
+        for v in succ[u]:
+            ES[v] = max(ES[v], ES[u] + dmin[u])
+    LB_crit = max((ES[u] + dmin[u] for u in topo), default=0)
+
+    # 2) Energetic bound cho renewables
+    LB_R = 0
+    for k in range(R):
+        Ek = 0
+        for j in range(1, J+1):
+            Ek += min(d * (req[k] if k < len(req) else 0) for d, req in modes[j])
+        cap = C[k]
+        if cap > 0:
+            LB_R = max(LB_R, (Ek + cap - 1) // cap)  # ceil
+    return max(LB_crit, LB_R)
+
+def compute_ub_ssgs(mm_reader, restarts, seed):
+    """
+    Trả về UB khả thi bằng SSGS (không dùng horizon của .mm).
+    UB = max finish_time của lịch tốt nhất trong 'restarts' lần.
+    """
+    import random
+    rng = random.Random(seed)
+
+    jobs = mm_reader.data['num_jobs']
+    R = mm_reader.data['num_renewable']
+    NR = mm_reader.data['num_nonrenewable']
+    Rcap = mm_reader.data['renewable_capacity']
+    Ncap = mm_reader.data['nonrenewable_capacity']
+    prec = mm_reader.data['precedence']
+    modes = mm_reader.data['job_modes']
+
+    # topo order
+    succ = {i: set(prec.get(i, [])) for i in range(1, jobs+1)}
+    preds = {i: set() for i in range(1, jobs+1)}
+    for u, Vs in succ.items():
+        for v in Vs: preds[v].add(u)
+    from collections import deque
+    q = deque([i for i in range(1, jobs+1) if not preds[i]])
+    topo = []
+    indeg = {i: len(preds[i]) for i in preds}
+    while q:
+        u = q.popleft(); topo.append(u)
+        for v in succ[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0: q.append(v)
+
+    # tiện ích: earliest feasible t trên profile R (tự giãn)
+    def earliest_feasible_start(dur, reqR, est, Rprof):
+        t = est
+        while True:
+            need_len = t + dur
+            for k in range(R):
+                if len(Rprof[k]) < need_len:
+                    Rprof[k].extend([Rcap[k]] * (need_len - len(Rprof[k])))
+            ok = True
+            for tau in range(t, t+dur):
+                for k in range(R):
+                    need = reqR[k] if k < len(reqR) else 0
+                    if need and Rprof[k][tau] < need:
+                        ok = False; break
+                if not ok: break
+            if ok: return t
+            t += 1
+
+    # chọn mode “dễ xếp”: (dur ↑, dùng R/N thấp) nhưng không vượt N còn lại
+    def pick_mode(j, Nrem):
+        best = None
+        for m,(dur,req) in enumerate(modes[j]):
+            # check non-renewable
+            ok = True
+            for kk in range(NR):
+                idx = R + kk
+                need = req[idx] if idx < len(req) else 0
+                if need > Nrem[kk]: ok=False; break
+            if not ok: continue
+            rsum = sum((req[k] if k < R else 0) for k in range(R))
+            nsum = sum((req[R+kk] if R+kk < len(req) else 0) for kk in range(NR))
+            key = (dur, rsum, nsum, m)   # ưu tiên dur nhỏ, dùng R/N nhỏ
+            if best is None or key < best[0]:
+                best = (key, m, dur, req)
+        return best
+
+    best = None
+    for _ in range(restarts):
+        # shuffle nhẹ trong các nhóm successor-similar để đa dạng
+        order = topo[:]
+        i = 0
+        while i < len(order):
+            j = i
+            while j+1 < len(order) and len(succ[order[j+1]]) == len(succ[order[i]]):
+                j += 1
+            block = order[i:j+1]
+            rng.shuffle(block)
+            order[i:j+1] = block
+            i = j+1
+
+        # khởi tạo profile
+        Rprof = [[Rcap[k]] for k in range(R)]
+        Nrem  = [Ncap[kk] for kk in range(NR)]
+        start, finish = {}, {}
+
+        feasible = True
+        for j in order:
+            est = 0
+            for p in preds[j]:
+                if p in finish: est = max(est, finish[p])
+
+            pick = pick_mode(j, Nrem)
+            if pick is None: feasible = False; break
+            _, m, dur, req = pick
+            reqR = [ (req[k] if k < R else 0) for k in range(R) ]
+            reqN = [ (req[R+kk] if R+kk < len(req) else 0) for kk in range(NR) ]
+
+            t = earliest_feasible_start(dur, reqR, est, Rprof)
+
+            # cập nhật profile
+            for tau in range(t, t+dur):
+                for k in range(R):
+                    need = reqR[k]
+                    if need: Rprof[k][tau] -= need
+            for kk in range(NR):
+                Nrem[kk] -= reqN[kk]
+                if Nrem[kk] < 0: feasible = False; break
+            if not feasible: break
+
+            start[j] = t; finish[j] = t + dur
+
+        if feasible:
+            mk = max(finish.values()) if finish else 0
+            best = mk if best is None else min(best, mk)
+
+    if best is None:
+        # fallback siêu an toàn: xếp nối chuỗi theo min duration
+        mk = 0
+        for j in topo:
+            dmin = min(d for d,_ in modes[j])
+            mk += dmin
+        best = mk
+
+    return best
+
 
 # ==========================
 #  Giải 1 instance với timeout & nhị phân makespan
@@ -1132,17 +1303,28 @@ def _atomic_dump_json(path: Path, payload: dict):
         os.fsync(f.fileno())
     tmp.replace(path)  # atomic rename
 
-def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | None = None):
-    """
-    Trả về dict:
-      instance, horizon, variables, clauses, makespan, status, Solve time, timeout, error
-    Nếu checkpoint_path != None: ghi checkpoint mỗi khi có nghiệm tốt hơn (best-so-far).
-    """
+def solve_instance_with_timeout(mm_path, timeout_s=31, checkpoint_path: Path | None = None):
     reader = load_reader(mm_path)
     enc = MRCPSPBlockBasedStaircase(reader)
 
-    lb = enc.calculate_critical_path_bound()
-    ub = reader.get_horizon()
+    data_for_lb = {
+        'num_jobs': enc.jobs,
+        'num_renewable': enc.renewable_resources,
+        'num_nonrenewable': enc.nonrenewable_resources,
+        'renewable_capacity': enc.R_capacity,
+        'nonrenewable_capacity': enc.N_capacity,
+        'precedence': enc.precedence,
+        'job_modes': enc.job_modes,
+    }
+
+    # LB cơ bản (CPM) + nâng bằng energetic LB
+    lb_cpm = enc.calculate_critical_path_bound()
+    lb_energy = compute_lb_energetic(data_for_lb)
+    lb = max(lb_cpm, lb_energy)
+
+    # UB khởi tạo
+    ub_ssgs = compute_ub_ssgs(reader, restarts=16, seed=4000)
+    ub = min(reader.get_horizon(), ub_ssgs)
 
     start = time.time()
     timeout_flag = False
@@ -1157,6 +1339,12 @@ def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | 
             break
 
         mid = (lo + hi) // 2
+
+        # Quick filter: nếu mid < energetic LB => chắc chắn infeasible, skip SAT
+        if mid < lb_energy:
+            lo = mid + 1
+            continue
+
         solution = enc.solve(mid)
 
         if time.time() - start > timeout_s:
@@ -1167,6 +1355,9 @@ def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | 
             best_makespan = mid
             best_vars = enc.last_var_count
             best_clauses = enc.last_clause_count
+            # nếu đã bằng LB thì tối ưu luôn, thoát sớm
+            if mid == lb:
+                break
             hi = mid - 1
 
             # ghi checkpoint ngay khi có nghiệm mới
@@ -1177,7 +1368,7 @@ def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | 
                     "variables": best_vars,
                     "clauses": best_clauses,
                     "makespan": best_makespan,
-                    "status": "Feasible",           # có nghiệm nhưng chưa chắc optimal
+                    "status": "Feasible",
                     "Solve time": f"{time.time()-start:.2f}",
                     "timeout": "No",
                     "error": ""
@@ -1190,7 +1381,7 @@ def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | 
 
     total_time = time.time() - start
     if timeout_flag:
-        status = "Feasible"  # yêu cầu của bạn: timeout => Feasible
+        status = "Feasible"  # theo yêu cầu của bạn
     else:
         status = "Optimal" if best_makespan is not None else "Infeasible"
 
@@ -1219,7 +1410,7 @@ def _worker_main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--mm", required=True, help="Đường dẫn file .mm")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=31)
     parser.add_argument("--out", required=True, help="Đường dẫn file JSON output")
     args = parser.parse_args()
 
@@ -1350,7 +1541,7 @@ def _run_worker_for_instance(mm_path: Path, time_limit: int) -> dict:
 def run_batch_MMLIB50(
     data_dir="data/MMLIB50",
     out_dir="result/MMLIB50",
-    timeout_s=600,
+    timeout_s=31,
 ):
     """
     Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
@@ -1426,5 +1617,5 @@ if __name__ == "__main__":
     run_batch_MMLIB50(
         data_dir="data/MMLIB50",
         out_dir="result/MMLIB50",
-        timeout_s=600,
+        timeout_s=31,
     )
