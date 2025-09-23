@@ -10,7 +10,8 @@ import math
 # === MMLIB50 Reader (chịu REQUESTS/DURATIONS có/không có ':') ===
 import os, re, uuid, subprocess, tempfile
 import stat
-import shutil
+import tempfile, shutil, os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import subprocess
 from copy import deepcopy
@@ -293,26 +294,60 @@ class MRCPSPBlockBasedStaircase:
             'connection_clauses': 0,
         }
 
-    def _add_pb_via_savilerow(self, pb_list: list[tuple[list[int], list[int], int]], batch_size: int = 1200,
-                              tmp_dir: str = "sr_tmp", savilerow_bin: str = "/home/nguyentan/savilerow-1.10.1-linux/savilerow"):
+    def _add_pb_via_savilerow(
+            self,
+            pb_list: list[tuple[list[int], list[int], int]],
+            batch_size: int = 1200,
+            tmp_dir: str = "sr_tmp",
+            savilerow_bin: str = "savilerow-1.10.1-linux/savilerow",
+            keep_tmp: bool = False,
+            max_workers: int | None = None,
+    ):
         """
-        Gom các PB (<=) rồi lần lượt:
-          pbs -> .eprime -> savilerow -> .dimacs -> clauses -> self.cnf.extend(...)
+        Parallel SR:
+          1) Chia pb_list thành các batch.
+          2) Chạy Savile Row cho từng batch SONG SONG (thread pool), nhận .dimacs.
+          3) Parse DIMACS và append vào self.cnf TUẦN TỰ để an toàn vpool.
+          4) Dọn rác từng batch_dir sau khi parse (nếu keep_tmp=False).
         """
         if not pb_list:
             return
-        os.makedirs(tmp_dir, exist_ok=True)
 
-        for i in range(0, len(pb_list), batch_size):
-            batch = pb_list[i:i + batch_size]
-            eprime = _sr_create_eprime_from_pbs(batch, tmp_dir)
-            dimacs = _sr_run_and_get_dimacs(eprime, tmp_dir, savilerow_bin=savilerow_bin)
-            cls = _sr_parse_dimacs_to_cnf(dimacs, self.vpool)
-            if cls:
-                self.cnf.extend(cls)
-                # nếu bạn có self.stats
-                if hasattr(self, "stats"):
-                    self.stats["clauses"] = len(self.cnf.clauses)
+        os.makedirs(tmp_dir, exist_ok=True)
+        # 1) Chia batch
+        batches = [pb_list[i:i + batch_size] for i in range(0, len(pb_list), batch_size)]
+        if not batches:
+            return
+
+        workers = _safe_workers(max_workers)
+
+        # 2) Chạy SR song song để tạo DIMACS
+        results = []  # giữ kết quả theo thứ tự gửi đi để reproducible
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = []
+            for b in batches:
+                fut = ex.submit(_run_sr_batch, b, tmp_dir, savilerow_bin)
+                futures.append(fut)
+            # Thu kết quả *theo đúng thứ tự nộp* (không dùng as_completed để giữ determinism)
+            for fut in futures:
+                batch_dir, dimacs = fut.result()
+                results.append((batch_dir, dimacs))
+
+        # 3) Parse DIMACS tuần tự (an toàn cho vpool) + 4) cleanup
+        try:
+            for (batch_dir, dimacs_path) in results:
+                cls = _sr_parse_dimacs_to_cnf(dimacs_path, self.vpool)
+                if cls:
+                    self.cnf.extend(cls)
+            if hasattr(self, "stats"):
+                self.stats["clauses"] = len(self.cnf.clauses)
+        finally:
+            if not keep_tmp:
+                for (batch_dir, _dimacs_path) in results:
+                    try:
+                        shutil.rmtree(batch_dir, ignore_errors=True)
+                    except Exception:
+                        pass
 
     def _remove_infeasible_and_dominated_modes(self):
         """1) Bỏ mode không khả thi (vượt capacity)  2) Bỏ mode bị chi phối (dominated)."""
@@ -984,7 +1019,7 @@ class MRCPSPBlockBasedStaircase:
                     pb_bucket.append((lits, weights, self.R_capacity[k]))
 
         # Gọi SR 1–vài lần
-        self._add_pb_via_savilerow(pb_bucket, batch_size=1500)
+        self._add_pb_via_savilerow(pb_bucket, batch_size=1500, max_workers=8)
 
         clauses_after = len(self.cnf.clauses)
         print(f"Số clauses sinh ra từ add_renewable_resource_constraints (qua SR): {clauses_after - clause_before}")
@@ -1034,7 +1069,7 @@ class MRCPSPBlockBasedStaircase:
                 if lits:
                     pb_bucket.append((lits, weights, Bk))
 
-        self._add_pb_via_savilerow(pb_bucket, batch_size=1500)
+        self._add_pb_via_savilerow(pb_bucket, batch_size=1500, max_workers=8)
 
         clauses_after = len(self.cnf.clauses)
         print(f"Số clauses sinh ra từ add_nonrenewable_resource_constraints (qua SR): {clauses_after - clause_before}")
@@ -1477,6 +1512,24 @@ def compute_ub_ssgs(mm_reader, restarts, seed):
 
     return best
 
+def _safe_workers(n):
+    try:
+        cpu = os.cpu_count() or 1
+    except Exception:
+        cpu = 1
+    # mặc định: tận dụng ~1/2 số core, tối đa 8
+    return max(1, min(8, n if n else max(1, cpu // 2)))
+
+def _run_sr_batch(batch, base_tmp_dir, savilerow_bin):
+    """
+    Chạy 1 batch Savile Row trong thư mục tạm riêng.
+    Trả về (batch_dir, dimacs_path). Không parse ở đây để tránh đụng vpool.
+    """
+    batch_dir = tempfile.mkdtemp(prefix="sr_batch_", dir=base_tmp_dir)
+    eprime = _sr_create_eprime_from_pbs(batch, batch_dir)
+    dimacs = _sr_run_and_get_dimacs(eprime, batch_dir, savilerow_bin=savilerow_bin)
+    return batch_dir, dimacs  # cleanup sau khi parse
+
 def _sr_create_eprime_from_pbs(pbs, out_dir: str) -> str:
     """
     pbs: list of (lits, weights, bound) cho ràng buộc sum(w_i * toInt(x_lit_i)) <= bound
@@ -1548,7 +1601,7 @@ def _is_executable_file(p: str) -> bool:
 import subprocess, shutil, os, stat
 from pathlib import Path
 
-def _sr_run_and_get_dimacs(eprime_path: str, out_dir: str, savilerow_bin: str = "./bin/savilerow/savilerow") -> str:
+def _sr_run_and_get_dimacs(eprime_path: str, out_dir: str, savilerow_bin: str = "savilerow-1.10.1-linux/savilerow") -> str:
     """
     Chạy Savile Row để xuất DIMACS; in ra thông báo lỗi nếu fail.
     """
@@ -1654,7 +1707,7 @@ def _sr_parse_dimacs_to_cnf(dimacs_path: str, vpool) -> list[list[int]]:
 
 
 if __name__ == "__main__":
-    DEFAULT_INSTANCE = "data/MMLIB50/J5066_2.mm"
+    DEFAULT_INSTANCE = "data/MMLIB50/J5013_5.mm"
     run_one_mmlib50(DEFAULT_INSTANCE, timeout_s=600)
 
 
