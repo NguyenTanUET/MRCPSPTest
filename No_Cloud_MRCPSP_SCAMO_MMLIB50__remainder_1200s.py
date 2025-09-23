@@ -1564,6 +1564,9 @@ def run_batch_MMLIB50(
 
     results = []
     mm_files = sorted(data_path.glob("*.mm"))
+    START_FROM = "J5025_3.mm"  # đổi theo checkpoint của bạn
+    mm_files = [p for p in mm_files if p.name >= START_FROM]
+    print(f"Resuming from {START_FROM}: {len(mm_files)} files")
     print(f"Found {len(mm_files)} instances in {data_path}")
 
     # Ghi header ngay khi tạo file

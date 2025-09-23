@@ -1,0 +1,19 @@
+sudo apt-get update -y
+sudo apt-get install -y tmux
+sudo apt-get install -y git python3 python3-venv python3-pip
+python3 -m venv venv
+git clone ... 
+cd ...
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install python-sat pypblib google-cloud-storage
+tmux new -s mrcpsp
+source ~/.../venv/bin/activate
+python .py
+Ctrl b -> ấn d
+tmux ls
+tmux attach -t rcpsp
+Scroll: Nhấn Ctrl +b rồi [ để vào chế độ copy/scrollback, sau đó dùng các phím mũi tên ↑↓ để xem log trước đó. Nhấn q để thoát chế độ này.
+
+Tạo cửa sổ mới: Ctrl +b rồi c (nếu bạn muốn chạy thêm tiến trình khác song song).
