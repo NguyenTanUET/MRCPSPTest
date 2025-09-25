@@ -299,7 +299,7 @@ class MRCPSPBlockBasedStaircase:
             pb_list: list[tuple[list[int], list[int], int]],
             batch_size: int = 1200,
             tmp_dir: str = "sr_tmp",
-            savilerow_bin: str = "savilerow-1.10.1-linux/savilerow",
+            savilerow_bin: str = "savilerow-1.10.1-linux",
             keep_tmp: bool = False,
             max_workers: int | None = None,
     ):
@@ -1601,7 +1601,7 @@ def _is_executable_file(p: str) -> bool:
 import subprocess, shutil, os, stat
 from pathlib import Path
 
-def _sr_run_and_get_dimacs(eprime_path: str, out_dir: str, savilerow_bin: str = "savilerow-1.10.1-linux/savilerow") -> str:
+def _sr_run_and_get_dimacs(eprime_path: str, out_dir: str, savilerow_bin: str = "savilerow-1.10.1-linux") -> str:
     """
     Chạy Savile Row để xuất DIMACS; in ra thông báo lỗi nếu fail.
     """
