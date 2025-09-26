@@ -9,6 +9,24 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install python-sat pypblib google-cloud-storage
 tmux new -s mrcpsp
+
+============= SAVILE ROW SCRIPT =================
+
+# Đổi đường dẫn cho đúng
+SRDIR="savilerow-1.10.1-linux"
+
+# Cho phép thực thi cho savilerow và toàn bộ binary trong bin/
+chmod +x "$SRDIR/savilerow" 2>/dev/null || true
+chmod -R +x "$SRDIR/bin" 2>/dev/null || true
+
+# Nếu có CRLF:
+command -v dos2unix >/dev/null 2>&1 && dos2unix "$SRDIR/savilerow" "$SRDIR/bin/"* 2>/dev/null || true
+
+# Kiểm tra nhanh:
+file "$SRDIR/bin/minion"
+ls -l "$SRDIR/bin/minion"
+==================================================
+
 source ~/.../venv/bin/activate
 python .py
 Ctrl b -> ấn d
@@ -17,3 +35,8 @@ tmux attach -t rcpsp
 Scroll: Nhấn Ctrl +b rồi [ để vào chế độ copy/scrollback, sau đó dùng các phím mũi tên ↑↓ để xem log trước đó. Nhấn q để thoát chế độ này.
 
 Tạo cửa sổ mới: Ctrl +b rồi c (nếu bạn muốn chạy thêm tiến trình khác song song).
+
+
+=================java install========================
+
+sudo apt-get install -y openjdk-17-jre-headless
