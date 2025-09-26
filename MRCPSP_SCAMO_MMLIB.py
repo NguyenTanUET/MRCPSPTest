@@ -13,6 +13,7 @@ from pathlib import Path
 from copy import deepcopy
 
 class MMLIB50Reader:
+
     def __init__(self, filename: str):
         self.filename = filename
         self.data = self._read_file()

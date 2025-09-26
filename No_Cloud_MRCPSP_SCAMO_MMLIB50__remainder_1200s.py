@@ -892,6 +892,9 @@ class MRCPSPBlockBasedStaircase:
         self.last_var_count = self.vpool.top if hasattr(self.vpool, 'top') else getattr(self.vpool, '_top', 0)
         return self.cnf
 
+
+
+
     def solve(self, makespan):
         """Solve with given makespan"""
         print(f"\n--- Solving with makespan = {makespan} ---")
