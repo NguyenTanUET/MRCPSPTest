@@ -16,8 +16,15 @@ pip install --upgrade pip
 pip install python-sat pypblib google-cloud-storage
 
 # ====== Clone & build Painless ======
-cd ~/MRCPSPTest/external/painless
+mkdir -p external
+cd external
+git clone https://github.com/lip6/painless.git
+cd painless
+
+# build release
 make release -j"$(nproc)"
+
+# quay lại root project
 cd ~/MRCPSPTest
 
 ============= SAVILE ROW SCRIPT =================
