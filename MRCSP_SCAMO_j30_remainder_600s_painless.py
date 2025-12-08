@@ -14,7 +14,22 @@ import csv
 from datetime import datetime
 
 # ===== NEW: imports cho sandbox subprocess & util =====
-import subprocess, sys, json, os, signal, uuid, traceback
+import subprocess, sys, json, os, signal, uuid, traceback, tempfile
+
+
+PAINLESS_BIN = (Path(__file__).resolve().parent /
+                "external" / "painless" / "build" / "release" /
+                "painless_release")
+
+USE_PAINLESS = True  # bật/tắt backend Painless
+
+# GCS (tùy chọn)
+try:
+    from google.cloud import storage  # pip install google-cloud-storage
+    _GCS_AVAILABLE = True
+except Exception:
+    storage = None
+    _GCS_AVAILABLE = False
 
 # ==========================
 #  Phần ENCODER
@@ -1185,6 +1200,71 @@ class MRCPSPBlockBasedStaircase:
         print(f"SAT for makespan {makespan} (time {solve_time:.3f}s)")
         return solution
 
+    def _solve_with_painless(self, threads=8, timeout=600):
+        """
+        Gọi Painless trên self.cnf và trả về model (list[int]) hoặc None nếu UNSAT.
+        """
+        if not PAINLESS_BIN.is_file():
+            raise RuntimeError(f"Painless binary not found at {PAINLESS_BIN}")
+
+        # 1) Ghi CNF ra file tạm
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".cnf") as f:
+            cnf_path = Path(f.name)
+        self.cnf.to_file(str(cnf_path))
+
+        # 2) Lệnh gọi Painless (local parallel, không dùng MPI)
+        cmd = [
+            str(PAINLESS_BIN),
+            f"-v=1",                 # verbose vừa phải để debug
+            f"-c={threads}",         # số solver/threads
+            f"-t={timeout}",         # timeout mỗi instance (giây)
+            str(cnf_path)
+        ]
+
+        start_time = time.time()
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        solve_time = time.time() - start_time
+        print(f"Painless solve time: {solve_time:.2f}s")
+
+        out = proc.stdout + "\n" + proc.stderr
+
+        # Option: xoá file CNF tạm
+        try:
+            cnf_path.unlink()
+        except OSError:
+            pass
+
+        # 3) Kiểm tra SAT/UNSAT trong output
+        if "UNSATISFIABLE" in out:
+            print("Instance is UNSAT according to Painless.")
+            return None
+        if "SATISFIABLE" not in out:
+            # Không parse được trạng thái – in log ra để xem
+            print("Painless output:\n", out)
+            raise RuntimeError("Cannot detect SAT/UNSAT status from Painless output.")
+
+        # 4) Parse model: các dòng bắt đầu bằng 'v ' chứa biến
+        model: list[int] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("v"):
+                continue
+            parts = line.split()[1:]  # bỏ 'v'
+            for lit_str in parts:
+                try:
+                    lit = int(lit_str)
+                except ValueError:
+                    continue
+                if lit == 0:
+                    continue
+                model.append(lit)
+
+        if not model:
+            print("WARNING: SAT but no model parsed; printing raw output:")
+            print(out)
+
+        return model if model else None
+
     def solve(self, makespan):
         """Solve with given makespan"""
         print(f"\n--- Solving with makespan = {makespan} ---")
@@ -1211,19 +1291,14 @@ class MRCPSPBlockBasedStaircase:
 
         # Solve
         print("Solving SAT instance...")
-        solver = Glucose42()
-        solver.append_formula(self.cnf)
-
-        start_time = time.time()
-        result = solver.solve()
-        solve_time = time.time() - start_time
-
-        print(f"Solve time: {solve_time:.2f}s")
-
-        if result:
-            return self.extract_solution(solver.get_model())
-        else:
+        # Dùng Painless (song song, qua binary)
+        model = self._solve_with_painless(
+            threads=32,  # chỉnh theo số core bạn muốn dùng
+            timeout=600  # hoặc theo timeout bạn đang set cho mỗi instance
+        )
+        if model is None:
             return None
+        return self.extract_solution(model)
 
     def extract_solution(self, model):
         """Extract solution from SAT model"""
@@ -1512,6 +1587,19 @@ def solve_instance_with_timeout(mm_path, timeout_s=600, checkpoint_path: Path | 
     }
     return row
 
+# ==========================
+#  GCS helpers
+# ==========================
+def _upload_to_gcs(bucket_name: str, local_file: Path, dest_blob: str):
+    """Upload 1 file lên GCS: gs://bucket_name/dest_blob"""
+    if not _GCS_AVAILABLE:
+        print("google-cloud-storage chưa được cài. Bỏ qua upload.")
+        return
+    client = storage.Client()  # dùng ADC hoặc GOOGLE_APPLICATION_CREDENTIALS
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(dest_blob)
+    blob.upload_from_filename(str(local_file))
+    print(f"  ☁ Uploaded to gs://{bucket_name}/{dest_blob}")
 
 # ==========================
 #  WORKER chế độ 1-instance (subprocess)
@@ -1656,6 +1744,8 @@ def run_batch_j30(
     data_dir="data/j30",
     out_dir="result/j30",
     timeout_s=600,
+    gcs_bucket: str | None = None,
+    gcs_prefix: str | None = "result/j30_remainder"
 ):
     """
     Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
@@ -1685,6 +1775,13 @@ def run_batch_j30(
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
 
+    # Upload header lên GCS
+    if gcs_bucket:
+        dest_blob = f"{gcs_prefix.rstrip('/')}/{csv_file.name}" if gcs_prefix else csv_file.name
+        try:
+            _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
+        except Exception as e:
+            print(f"  ⚠ Không thể upload header lên GCS: {e}")
 
     for idx, mm in enumerate(mm_files, start=1):
         print(f"[{idx}/{len(mm_files)}] Solving {mm.name} ...")
@@ -1708,6 +1805,14 @@ def run_batch_j30(
                 writer.writerows(results[-10:])
             print(f"  ✓ Đã lưu tạm 10 dòng vào {csv_file}")
 
+            # Upload bản cập nhật CSV lên GCS
+            if gcs_bucket:
+                dest_blob = f"{gcs_prefix.rstrip('/')}/{csv_file.name}" if gcs_prefix else csv_file.name
+                try:
+                    _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
+                except Exception as e:
+                    print(f"  ⚠ Không thể upload batch lên GCS: {e}")
+
     # Ghi nốt phần còn lại (<10 cuối)
     remainder = len(results) % 10
     if remainder:
@@ -1715,6 +1820,18 @@ def run_batch_j30(
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
             writer.writerows(results[-remainder:])
         print(f"  ✓ Đã lưu phần còn lại ({remainder} dòng) vào {csv_file}")
+
+    # Upload lần cuối
+    if gcs_bucket:
+        dest_blob = f"{gcs_prefix.rstrip('/')}/{csv_file.name}" if gcs_prefix else csv_file.name
+        try:
+            _upload_to_gcs(gcs_bucket, csv_file, dest_blob)
+        except Exception as e:
+            print(f"  ⚠ Không thể upload lần cuối lên GCS: {e}")
+
+    print(f"\nHoàn tất. Kết quả lưu tại: {csv_file}")
+    if gcs_bucket:
+        print(f"  Và tại: gs://{gcs_bucket}/{dest_blob}")
 
     return csv_file
 

@@ -1,0 +1,11 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+j3010_1.mm,247,237967,790162,26,Optimal,0.48,No,
+j3010_10.mm,260,215288,803130,32,Optimal,0.44,No,
+j3010_2.mm,241,195337,709835,28,Optimal,0.50,No,
+j3010_3.mm,240,223801,774485,24,Optimal,0.47,No,
+j3010_4.mm,237,202760,735076,36,Optimal,0.47,No,
+j3010_5.mm,237,179820,700767,33,Optimal,0.50,No,
+j3010_6.mm,238,243922,795525,25,Optimal,0.57,No,
+j3010_7.mm,233,226275,748503,22,Optimal,0.51,No,
+j3010_8.mm,243,246257,810761,31,Optimal,0.50,No,
+j3010_9.mm,237,196206,711428,38,Optimal,0.41,No,

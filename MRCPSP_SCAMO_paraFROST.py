@@ -1221,9 +1221,9 @@ class MRCPSPBlockBasedStaircase:
             return None
 
 def run_precedence_aware_encoding(
-    test_file="data/j30/j3037_1.mm",
+    test_file="data/j30/j3045_6.mm",
     parafrost_bin= "/home/nguyentan/ParaFROST/build/gpu/bin/parafrost",
-    timeout=25200,
+    timeout=84000,
     extra_args=None,
 ):
     """Chạy encoder với ParaFROST (GPU), có tìm tối ưu + fallback."""
@@ -1311,16 +1311,16 @@ if __name__ == "__main__":
     print(os.path.exists("/home/nguyentan/ParaFROST/build/gpu/bin/parafrost"))
     print(os.access("/home/nguyentan/ParaFROST/build/gpu/bin/parafrost", os.X_OK))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--inst", default="data/j30/j3037_1.mm", help="Đường dẫn file .mm")
+    ap.add_argument("--inst", default="data/j30/j3045_6.mm", help="Đường dẫn file .mm")
     ap.add_argument("--parafrost", default="/home/nguyentan/ParaFROST/build/gpu/bin/parafrost", help="Đường dẫn binary parafrost (hoặc tên nếu đã có trong PATH)")
-    ap.add_argument("--timeout", type=int, default=25200, help="Giới hạn thời gian solver (giây)")
+    ap.add_argument("--timeout", type=int, default=84000, help="Giới hạn thời gian solver (giây)")
     ap.add_argument("--args", default="", help="Extra args cho ParaFROST (vd: \"-q --no-store\")")
     a = ap.parse_args()
     extra = shlex.split(a.args) if a.args else None
     run_precedence_aware_encoding(
-        test_file="data/j30/j3037_1.mm",
+        test_file="data/j30/j3045_6.mm",
         parafrost_bin="/home/nguyentan/ParaFROST/build/gpu/bin/parafrost",
-        timeout=25200,
+        timeout=84000,
         extra_args=["-model", "-modelprint", "-report", "-profilegpu", "--verbose=2"]
     )
 
