@@ -1,0 +1,191 @@
+instance,horizon,variables,clauses,makespan,status,Solve time,timeout,error
+J50100_1.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50100_2.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50100_3.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50100_4.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50100_5.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50101_1.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50101_2.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50101_3.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50101_4.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"
+J50101_5.mm,,0,0,,Error,0.00,No,"invalid literal for int() with base 10: 'R'
+Traceback (most recent call last):
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1601, in _worker_main
+    row = solve_instance_with_timeout(mm_path, timeout_s=args.timeout, checkpoint_path=out_path)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1507, in solve_instance_with_timeout
+    reader = load_reader(mm_path)
+             ^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/No_cloud_MRCSP_SCAMO_MMLIB50_remainder_600s_painless.py"", line 1487, in load_reader
+    return MRCPSPDataReader(str(mm_path))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 10, in __init__
+    self.data = self.read_file()
+                ^^^^^^^^^^^^^^^^
+  File ""/mnt/d/github/MRCPSPTest/MRCPSP_Basic.py"", line 61, in read_file
+    job_id = int(parts[0])
+             ^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'R'
+"

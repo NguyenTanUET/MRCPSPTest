@@ -1293,7 +1293,7 @@ class MRCPSPBlockBasedStaircase:
         print("Solving SAT instance...")
         # Dùng Painless (song song, qua binary)
         model = self._solve_with_painless(
-            threads=32,  # chỉnh theo số core bạn muốn dùng
+            threads=4,  # chỉnh theo số core bạn muốn dùng
             timeout=600  # hoặc theo timeout bạn đang set cho mỗi instance
         )
         if model is None:
@@ -1745,7 +1745,7 @@ def run_batch_j30(
     out_dir="result/j30",
     timeout_s=600,
     gcs_bucket: str | None = None,
-    gcs_prefix: str | None = "result/j30_remainder"
+    gcs_prefix: str | None = "result/j30"
 ):
     """
     Nếu gcs_bucket != None, mỗi lần ghi CSV sẽ upload file lên:
@@ -1849,4 +1849,6 @@ if __name__ == "__main__":
         data_dir="data/j30",
         out_dir="result/j30",
         timeout_s=600,
+        gcs_bucket="mrcpsp",
+        gcs_prefix="result/j30"
     )
